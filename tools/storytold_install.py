@@ -537,6 +537,16 @@ def _require_windows_recipe(source: Path, repo: str) -> list[str] | None:
     return _windows_recipe_bins(source, repo)
 
 
+def _recipe_supports_built_without_craft_fonts(source: Path) -> bool:
+    """Recognize the opt-in PdfCraft packaging switch in the verified recipe."""
+    script = source / "packaging" / "windows" / "package.ps1"
+    try:
+        text = script.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise InstallError(f"could not read Windows packaging recipe {script}: {exc}") from exc
+    return bool(re.search(r"(?im)\[\s*switch\s*\]\s*\$BuiltWithoutCraftFonts\b", text))
+
+
 def _load_metadata(source: Path, env: dict[str, str], log: Any) -> dict[str, Any]:
     result = _run(
         ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
@@ -862,6 +872,12 @@ def prepare_msi_repo(root: Path, repo: str) -> str:
                     raise InstallError("Windows recipe does not have exactly one pinned Package UpgradeCode")
                 log.write(f"rollback-safe WiX recipe: {candidates[0][0]} (edited={candidates[0][1]})\n")
                 package_argv = ["pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", os.fspath(script), "-Arch", "x64", "-SkipBuild"]
+                if (
+                    repo == "pdfcraft"
+                    and not env.get("CRAFT_FONTS_DIR", "").strip()
+                    and _recipe_supports_built_without_craft_fonts(source)
+                ):
+                    package_argv.append("-BuiltWithoutCraftFonts")
                 log.write("$ " + " ".join(package_argv) + "\n")
                 if _stream_command(package_argv, cwd=source, env=env, log=log):
                     raise InstallError("Windows MSI packaging failed")

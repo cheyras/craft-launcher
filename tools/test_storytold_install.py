@@ -269,6 +269,16 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(install.InstallError, "no documented Windows packaging recipe"):
             install._require_windows_recipe(source, "effectcraft")
 
+    def test_pdfcraft_font_switch_requires_recipe_support_and_missing_fonts(self):
+        source = self.root / "recipe"
+        script = source / "packaging" / "windows"
+        script.mkdir(parents=True)
+        package = script / "package.ps1"
+        package.write_text("param([switch] $BuiltWithoutCraftFonts)\n", encoding="utf-8")
+        self.assertTrue(install._recipe_supports_built_without_craft_fonts(source))
+        package.write_text("param([switch] $OtherSwitch)\n", encoding="utf-8")
+        self.assertFalse(install._recipe_supports_built_without_craft_fonts(source))
+
     def test_special_recipe_feature_flags(self):
         target = "x86_64-pc-windows-msvc"
         photo = install._cargo_build_argv("photocraft", ["photocraft", "photocraft-cli"], target)
