@@ -169,7 +169,7 @@ impl PersonalForks {
     pub fn draw_header(&self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
         let size = egui::vec2(screen.width(), 48.0);
-        egui::Area::new(egui::Id::unique("storytold-personal-header")).order(egui::Order::Foreground).fixed_pos(screen.left_top()).show(ctx, |ui| {
+        egui::Area::new(egui::Id::unique("storytold-personal-header")).order(egui::Order::Middle).fixed_pos(screen.left_top()).show(ctx, |ui| {
             ui.set_min_size(size);
             ui.set_max_size(size);
             let rect = ui.max_rect();
