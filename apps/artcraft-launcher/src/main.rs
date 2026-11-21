@@ -12,6 +12,8 @@ mod motion;
 mod settings_file;
 #[cfg(target_os = "macos")]
 mod spaces;
+#[cfg(windows)]
+mod storytold_forks;
 #[cfg(target_os = "linux")]
 mod system_theme;
 mod tray;
@@ -770,6 +772,10 @@ struct Launcher {
     /// eframe's settings file, which the launcher writes itself while there is no window.
     settings_path: Option<PathBuf>,
     waker: Option<Arc<Waker>>,
+    /// A replacement waits until both official and personal mutations are safely idle.
+    replace_pending: bool,
+    #[cfg(windows)]
+    forks: storytold_forks::PersonalForks,
 }
 
 impl Launcher {
@@ -792,6 +798,9 @@ impl Launcher {
             closed_to_tray: false,
             settings_path,
             waker: None,
+            replace_pending: false,
+            #[cfg(windows)]
+            forks: storytold_forks::PersonalForks::new(),
         }
     }
 
@@ -803,6 +812,11 @@ impl Launcher {
             self.restore_saved_settings(settings);
         }
         self.waker = Some(waker.clone());
+        #[cfg(windows)]
+        self.forks.start({
+            let waker = waker.clone();
+            Arc::new(move || waker.wake())
+        });
         let (wake, on_quit) = (waker.clone(), waker.clone());
         match tray::Tray::new(move || wake.wake(), move || on_quit.quit_from_tray()) {
             Ok(t) => self.tray = Some(t),
@@ -846,12 +860,33 @@ impl Launcher {
         }
     }
 
+    fn personal_mutation_active(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.forks.mutation_active()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     /// The work that goes on with or without a window. Returns what the user asked for.
     fn tick(&mut self, ctx: &egui::Context) -> Vec<Request> {
+        #[cfg(windows)]
+        self.forks.tick();
+        #[cfg(windows)]
+        let saved_auto_update = if self.forks.personal() { Some(std::mem::replace(&mut self.ui.settings.auto_update, false)) } else { None };
         self.ui.logic(ctx, &mut self.host);
+        #[cfg(windows)]
+        if let Some(saved) = saved_auto_update {
+            self.ui.settings.auto_update = saved;
+        }
         let mut requests = Vec::new();
         let starts: Vec<single_instance::Request> = self.starts.try_iter().collect();
-        if starts.contains(&single_instance::Request::Replace) && !self.ui.busy() {
+        self.replace_pending |= starts.contains(&single_instance::Request::Replace);
+        if self.replace_pending && !self.ui.busy() && !self.personal_mutation_active() {
+            self.replace_pending = false;
             // A newer launcher is starting and takes over once this one has quit.
             requests.push(Request::Quit);
         } else if !starts.is_empty() {
@@ -875,16 +910,20 @@ impl Launcher {
                     if let Some(waker) = &self.waker {
                         waker.quit_seen();
                     }
-                    requests.push(Request::Quit);
+                    if !self.personal_mutation_active() {
+                        requests.push(Request::Quit);
+                    }
                 }
             }
         }
         if let Some(t) = self.tray.as_mut() {
             t.set_updates(self.ui.update_count());
         }
-        if self.host.quit {
+        if self.host.quit && !self.personal_mutation_active() {
             self.host.quit = false;
             requests.push(Request::Quit);
+        } else if self.host.quit {
+            self.host.quit = false;
         }
         requests
     }
@@ -1091,13 +1130,18 @@ impl eframe::App for Shell<'_> {
             match request {
                 Request::Toggle if self.visible => self.put_away(ctx),
                 Request::Toggle | Request::Show => self.show(ctx),
-                Request::Quit => self.quit(ctx),
+                Request::Quit if !self.launcher.personal_mutation_active() => self.quit(ctx),
+                Request::Quit => {}
             }
         }
         // The close button puts the window away in the tray unless the user chose to quit. That is
         // the window manager's button or the header's own (no decorations), which asks to close
         // with `ViewportCommand::Close` and arrives here the same way.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && !self.launcher.closed_to_tray {
+            if self.launcher.personal_mutation_active() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                return;
+            }
             match on_close(self.launcher.tray.is_some(), self.launcher.ui.settings.close_to_tray, self.window_hides) {
                 OnClose::Hide => {
                     self.launcher.ui.hidden_to_tray(&mut self.launcher.host);
@@ -1115,6 +1159,17 @@ impl eframe::App for Shell<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        if self.launcher.forks.personal() {
+            let release_busy = self.launcher.ui.busy();
+            self.launcher.forks.draw_header(ui.ctx());
+            self.launcher.forks.draw_personal(ui.ctx(), release_busy);
+            self.launcher.forks.draw_switch(ui.ctx());
+        } else {
+            self.launcher.ui.ui(ui, &mut self.launcher.host);
+            self.launcher.forks.draw_switch(ui.ctx());
+        }
+        #[cfg(not(windows))]
         self.launcher.ui.ui(ui, &mut self.launcher.host);
         ui.ctx().output_mut(|o| {
             o.commands.retain(|cmd| {

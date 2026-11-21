@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+"""Install verified ``cheyras`` Storytold forks from their ``chey`` branch.
+
+This module deliberately uses only the Python standard library.  All external
+programs are invoked with argv lists (never through a shell), which also makes
+the security-sensitive Git and Cargo boundaries straightforward to test.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+
+ACCOUNT = "cheyras"
+UPSTREAM = "storytold"
+BRANCH = "chey"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$")
+GITHUB_URL_RE = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?$",
+    re.IGNORECASE,
+)
+NORMAL_RECIPES = {"anicraft", "texturecraft", "materialcraft", "craft-anything"}
+LAUNCHER_REPO = "craft-launcher"
+SUPPORTED = NORMAL_RECIPES | {LAUNCHER_REPO}
+NOTICE_NAMES = ("README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "ATTRIBUTION.md")
+
+
+class InstallError(RuntimeError):
+    """An expected, user-actionable installer failure."""
+
+
+class MixedGitHubResponse(InstallError):
+    """A partial response that must not be flattened into per-repo states."""
+
+
+def validate_slug(value: str) -> str:
+    slug = value.strip().lower()
+    if value != slug or not SLUG_RE.fullmatch(slug) or "--" in slug:
+        raise InstallError(f"invalid repository slug: {value!r}")
+    return slug
+
+
+def _run(
+    argv: Sequence[str | os.PathLike[str]],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    stdout: Any = subprocess.PIPE,
+    stderr: Any = subprocess.PIPE,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            [os.fspath(item) for item in argv],
+            cwd=cwd,
+            env=env,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=stdout,
+            stderr=stderr,
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if _is_windows() else 0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InstallError(f"{argv[0]} timed out after {timeout:g} seconds") from exc
+    except OSError as exc:
+        raise InstallError(f"could not run {argv[0]}: {exc}") from exc
+    if check and result.returncode:
+        message = (result.stderr or result.stdout or "").strip()
+        raise InstallError(f"{argv[0]} failed ({result.returncode}): {message}")
+    return result
+
+
+def _github_repo(url: str) -> tuple[str, str] | None:
+    match = GITHUB_URL_RE.fullmatch(url.strip().rstrip("/"))
+    return (match.group(1).lower(), match.group(2).lower()) if match else None
+
+
+def _git_url(repo: Path, remote: str) -> str:
+    result = _run(["git", "-C", repo, "remote", "get-url", remote], check=False)
+    if result.returncode:
+        raise InstallError(f"{repo} has no {remote!r} Git remote")
+    return result.stdout.strip()
+
+
+def validate_clone(root: Path, repo: str) -> Path:
+    clone = root / repo
+    result = _run(["git", "-C", clone, "rev-parse", "--is-inside-work-tree"], check=False)
+    if result.returncode or result.stdout.strip() != "true":
+        raise InstallError(f"missing or invalid local clone: {clone}")
+    if _github_repo(_git_url(clone, "origin")) != (ACCOUNT, repo):
+        raise InstallError(f"{clone} origin is not https://github.com/{ACCOUNT}/{repo}")
+    if _github_repo(_git_url(clone, "upstream")) != (UPSTREAM, repo):
+        raise InstallError(f"{clone} upstream is not https://github.com/{UPSTREAM}/{repo}")
+    return clone
+
+
+def data_root() -> Path:
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        raise InstallError("LOCALAPPDATA is not set; this command requires a Windows user profile")
+    return Path(local) / "StorytoldForks"
+
+
+def _receipt_path(repo: str) -> Path:
+    return data_root() / repo / "active.json"
+
+
+def read_receipt(repo: str) -> dict[str, Any] | None:
+    # Status validation is intentionally usable in Linux test/scout
+    # environments; only Windows build/open require the per-user data root.
+    if not os.environ.get("LOCALAPPDATA") and os.name != "nt":
+        return None
+    path = _receipt_path(repo)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InstallError(f"invalid install receipt {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise InstallError(f"invalid install receipt {path}: expected an object")
+    version = data_root() / repo / "versions" / str(value.get("sha", ""))
+    return _validate_receipt_payload(repo, value, version, path)
+
+
+def _validate_receipt_payload(
+    repo: str, value: dict[str, Any], version: Path, receipt_path: Path
+) -> dict[str, Any]:
+    """Validate a receipt and every byte of its immutable payload."""
+    if value.get("schema") != 1 or value.get("repo") != repo:
+        raise InstallError(f"invalid install receipt {receipt_path}: wrong schema or repository")
+    sha = value.get("sha")
+    executable = value.get("executable")
+    files = value.get("files")
+    hashes = value.get("sha256")
+    if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
+        raise InstallError(f"invalid install receipt {receipt_path}: bad commit SHA")
+    if not isinstance(executable, str) or not executable or Path(executable).is_absolute():
+        raise InstallError(f"invalid install receipt {receipt_path}: bad executable path")
+    if not isinstance(files, list) or not files or any(not isinstance(x, str) for x in files):
+        raise InstallError(f"invalid install receipt {receipt_path}: bad file list")
+    if len(set(files)) != len(files) or not isinstance(hashes, dict) or set(hashes) != set(files):
+        raise InstallError(f"invalid install receipt {receipt_path}: bad file hashes")
+    if executable not in files:
+        raise InstallError(f"invalid install receipt {receipt_path}: executable is not in file list")
+    version = version.resolve()
+    exe = (version / executable).resolve()
+    try:
+        exe.relative_to(version)
+    except ValueError as exc:
+        raise InstallError(f"invalid install receipt {receipt_path}: executable escapes version directory") from exc
+    if not exe.is_file():
+        raise InstallError(f"installed executable is missing: {exe}")
+    for relative in files:
+        candidate = (version / relative).resolve()
+        try:
+            candidate.relative_to(version)
+        except ValueError as exc:
+            raise InstallError(f"invalid install receipt {receipt_path}: file escapes version directory") from exc
+        if not candidate.is_file():
+            raise InstallError(f"installed file is missing: {candidate}")
+        expected = hashes.get(relative)
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise InstallError(f"invalid install receipt {receipt_path}: bad hash for {relative}")
+        try:
+            actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise InstallError(f"could not validate installed file {candidate}: {exc}") from exc
+        if actual != expected:
+            raise InstallError(f"installed file does not match its receipt: {candidate}")
+    value["_exe"] = str(exe)
+    return value
+
+
+def _graphql_query(repos: Sequence[str]) -> tuple[str, dict[str, str]]:
+    variables: list[str] = []
+    fields: list[str] = []
+    mapping: dict[str, str] = {}
+    for index, repo in enumerate(repos):
+        key = f"r{index}"
+        variable = f"n{index}"
+        mapping[key] = repo
+        variables.append(f"${variable}:String!")
+        fields.append(
+            f'{key}:repository(owner:"{ACCOUNT}",name:${variable}){{'
+            "nameWithOwner isFork parent{name owner{login}} "
+            f'ref(qualifiedName:"refs/heads/{BRANCH}"){{target{{... on Commit{{oid}}}}}}'
+            "}"
+        )
+    return f"query({','.join(variables)}){{{''.join(fields)}}}", mapping
+
+
+def query_forks(repos: Sequence[str]) -> dict[str, dict[str, Any] | None]:
+    """Return exact fork/branch metadata using one bounded GraphQL request."""
+    query, mapping = _graphql_query(repos)
+    argv = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for index, repo in enumerate(repos):
+        argv.extend(["-F", f"n{index}={repo}"])
+    env = os.environ.copy()
+    env["GH_PROMPT_DISABLED"] = "1"
+    result = _run(argv, check=False, timeout=30.0, env=env)
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        detail = (result.stderr or "GitHub status query returned invalid JSON").strip()
+        raise InstallError(f"GitHub status query failed: {detail}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        raise InstallError("GitHub status query returned no data")
+    errors = payload.get("errors", [])
+    if not isinstance(errors, list):
+        raise InstallError("GitHub status query returned an invalid errors list")
+    missing_aliases: set[str] = set()
+    unknown_errors: list[str] = []
+    for error in errors:
+        path = error.get("path") if isinstance(error, dict) else None
+        alias = path[0] if isinstance(path, list) and len(path) == 1 else None
+        message = str(error.get("message", "GitHub query error")) if isinstance(error, dict) else str(error)
+        repo = mapping.get(alias) if isinstance(alias, str) else None
+        corroborated = repo is not None and alias in payload["data"] and payload["data"][alias] is None
+        names_repo = repo is not None and f"'{ACCOUNT}/{repo}'" in message
+        if (
+            isinstance(error, dict)
+            and error.get("type") == "NOT_FOUND"
+            and corroborated
+            and names_repo
+            and "Could not resolve to a Repository" in message
+        ):
+            missing_aliases.add(alias)
+        else:
+            unknown_errors.append(message)
+    if unknown_errors or (result.returncode and not missing_aliases):
+        detail = "; ".join(unknown_errors) or (result.stderr or f"gh exited {result.returncode}").strip()
+        error = MixedGitHubResponse if missing_aliases and unknown_errors else InstallError
+        raise error("GitHub status query error: " + detail)
+    output: dict[str, dict[str, Any] | None] = {}
+    for key, repo in mapping.items():
+        node = payload["data"].get(key)
+        if node is None:
+            if key in missing_aliases:
+                output[repo] = None
+            else:
+                raise InstallError(f"GitHub returned an unexplained empty result for {ACCOUNT}/{repo}")
+        elif not isinstance(node, dict):
+            raise InstallError(f"GitHub returned invalid metadata for {ACCOUNT}/{repo}")
+        else:
+            _validate_remote_node(repo, node, require_branch=False)
+            output[repo] = node
+    return output
+
+
+def _validate_remote_node(repo: str, node: dict[str, Any], *, require_branch: bool) -> str | None:
+    """Validate the complete queried identity, optionally returning its branch SHA."""
+    parent = node.get("parent")
+    owner = parent.get("owner") if isinstance(parent, dict) else None
+    if (
+        node.get("nameWithOwner") != f"{ACCOUNT}/{repo}"
+        or node.get("isFork") is not True
+        or not isinstance(parent, dict)
+        or parent.get("name") != repo
+        or not isinstance(owner, dict)
+        or owner.get("login") != UPSTREAM
+    ):
+        raise InstallError(f"{ACCOUNT}/{repo} is not a fork of {UPSTREAM}/{repo}")
+    ref = node.get("ref")
+    oid = ref.get("target", {}).get("oid") if isinstance(ref, dict) else None
+    if oid is None and not require_branch:
+        return None
+    if not isinstance(oid, str) or not SHA_RE.fullmatch(oid):
+        raise InstallError(f"{ACCOUNT}/{repo} has no valid refs/heads/{BRANCH}")
+    return oid
+
+
+def _row(repo: str, state: str, detail: str, remote: str | None = None, installed: str | None = None) -> dict[str, Any]:
+    return {"repo": repo, "state": state, "remote_sha": remote, "installed_sha": installed, "detail": detail}
+
+
+def status_rows(root: Path, repos: Sequence[str]) -> list[dict[str, Any]]:
+    try:
+        metadata = query_forks(repos)
+    except MixedGitHubResponse:
+        # A confirmed absence mixed with an unrelated denial cannot safely be
+        # represented as independent rows: reject the entire lookup.
+        raise
+    except InstallError as exc:
+        # Status is a machine protocol: even service/auth failures are rows,
+        # never prose or a misleading collection of "new" repositories.
+        rows: list[dict[str, Any]] = []
+        for repo in repos:
+            try:
+                receipt = read_receipt(repo)
+                installed = receipt["sha"] if receipt else None
+            except InstallError as receipt_error:
+                rows.append(_row(repo, "error", f"{exc}; {receipt_error}"))
+            else:
+                rows.append(_row(repo, "error", str(exc), installed=installed))
+        return rows
+    rows: list[dict[str, Any]] = []
+    for repo in repos:
+        node = metadata[repo]
+        if node is None:
+            rows.append(_row(repo, "new", f"{ACCOUNT}/{repo} does not exist"))
+            continue
+        try:
+            oid = _validate_remote_node(repo, node, require_branch=False)
+        except InstallError as exc:
+            rows.append(_row(repo, "error", str(exc)))
+            continue
+        if oid is None:
+            rows.append(_row(repo, "needs-branch", f"fork exists but refs/heads/{BRANCH} is missing"))
+            continue
+        clone = root / repo
+        if not clone.exists():
+            rows.append(_row(repo, "needs-clone", f"missing local clone: {clone}", oid))
+            continue
+        try:
+            validate_clone(root, repo)
+        except InstallError as exc:
+            rows.append(_row(repo, "error", str(exc), oid))
+            continue
+        try:
+            receipt = read_receipt(repo)
+        except InstallError as exc:
+            rows.append(_row(repo, "error", str(exc), oid))
+            continue
+        installed = receipt["sha"] if receipt else None
+        detail = "fork and local clone are ready" if receipt is None else f"installed {installed}"
+        rows.append(_row(repo, "ready", detail, oid, installed))
+    return rows
+
+
+def command_fork(root: Path, repo: str) -> None:
+    sibling = root / "storytold_forks.py"
+    if not sibling.is_file():
+        raise InstallError(f"missing bootstrap helper: {sibling}")
+    _run([sys.executable, sibling, "--root", root, "bootstrap", repo], timeout=300.0)
+    print(f"prepared {ACCOUNT}/{repo}")
+
+
+def _host_target() -> str:
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "aarch64-pc-windows-msvc"
+    if machine in {"amd64", "x86_64"}:
+        return "x86_64-pc-windows-msvc"
+    raise InstallError(f"unsupported Windows architecture: {platform.machine()}")
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def select_packages(
+    metadata: dict[str, Any], repo: str, required_binaries: Sequence[str] | None = None
+) -> tuple[list[str], list[str]]:
+    packages = metadata.get("packages")
+    if not isinstance(packages, list):
+        raise InstallError("cargo metadata did not contain a package list")
+    bins: dict[str, set[str]] = {}
+    for package in packages:
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            continue
+        targets = package.get("targets", [])
+        bins[package["name"]] = {
+            target.get("name")
+            for target in targets
+            if isinstance(target, dict) and "bin" in target.get("kind", []) and isinstance(target.get("name"), str)
+        }
+    if repo == LAUNCHER_REPO:
+        required = {"artcraft-launcher": "artcraft-launcher", "artcraft-launcher-mcp": "craft-ai-mcp"}
+        for package, binary in required.items():
+            if binary not in bins.get(package, set()):
+                raise InstallError(f"verified launcher recipe requires {package!r} package with {binary!r} binary")
+        return list(required), list(required.values())
+    if repo not in NORMAL_RECIPES:
+        raise InstallError(f"{repo} has no verified Windows source-build recipe")
+    required = list(required_binaries or [repo])
+    if not required or required[0] != repo:
+        raise InstallError(f"Windows recipe must name {repo!r} as its GUI binary")
+    for binary in required:
+        if binary not in bins or binary not in bins[binary]:
+            raise InstallError(f"verified recipe requires package and binary named {binary!r}")
+    selected = list(required)
+    executables = list(required)
+    cli = f"{repo}-cli"
+    if cli not in selected and cli in bins and cli in bins[cli]:
+        selected.append(cli)
+        executables.append(cli)
+    return selected, executables
+
+
+def _windows_recipe_bins(source: Path, repo: str) -> list[str] | None:
+    """Read the recipe's unconditional $Bins declaration when it has one.
+
+    The public Craft recipes use this declaration as their runtime payload
+    contract. Conditional ``$Bins +=`` entries remain optional; only names in
+    the initial literal array are required.
+    """
+    script = source / "packaging" / "windows" / "package.ps1"
+    if not script.is_file():
+        return None
+    try:
+        text = script.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise InstallError(f"could not read Windows packaging recipe {script}: {exc}") from exc
+    match = re.search(r"(?im)^\s*\$Bins\s*=\s*@\(([^)]*)\)", text)
+    if not match:
+        return None
+    names = re.findall(r"['\"]([a-z0-9][a-z0-9-]*)['\"]", match.group(1))
+    if not names or len(names) != len(set(names)) or names[0] != repo:
+        raise InstallError(f"invalid $Bins declaration in {script}")
+    return names
+
+
+def _load_metadata(source: Path, env: dict[str, str], log: Any) -> dict[str, Any]:
+    result = _run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
+        cwd=source,
+        env=env,
+        check=False,
+    )
+    log.write("$ cargo metadata --format-version 1 --no-deps --locked\n")
+    log.write(result.stdout)
+    log.write(result.stderr)
+    if result.returncode:
+        raise InstallError(f"cargo metadata failed ({result.returncode})")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise InstallError("cargo metadata returned invalid JSON") from exc
+
+
+def _stream_command(
+    argv: Sequence[str], *, cwd: Path, env: dict[str, str], log: Any
+) -> int:
+    """Stream a long-running command directly to a durable log.
+
+    The child inherits the log's OS handle, so Python never decodes or retains
+    arbitrary compiler output. Short metadata commands use ``_run`` with
+    replacement decoding because their structured stdout must be parsed.
+    """
+    log.flush()
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if _is_windows() else 0,
+        )
+        return process.wait()
+    except OSError as exc:
+        raise InstallError(f"could not run {argv[0]}: {exc}") from exc
+
+
+def _copy_payload(source: Path, bin_dir: Path, stage: Path, binaries: Sequence[str]) -> list[str]:
+    copied: list[str] = []
+    for binary in binaries:
+        name = f"{binary}.exe"
+        src = bin_dir / name
+        if not src.is_file():
+            raise InstallError(f"Cargo succeeded but expected binary is missing: {src}")
+        shutil.copy2(src, stage / name)
+        copied.append(name)
+    for name in NOTICE_NAMES:
+        src = source / name
+        if src.is_file():
+            shutil.copy2(src, stage / name)
+            copied.append(name)
+    # Craft Anything embeds redistributable fonts.  Preserve the public OFL
+    # notices named by its Windows packaging recipe without copying font data.
+    font_notices = source / "assets" / "fonts"
+    if font_notices.is_dir():
+        for src in sorted(font_notices.glob("OFL-*.txt")):
+            destination = stage / src.name
+            shutil.copy2(src, destination)
+            copied.append(src.name)
+    # Public package recipes may provide explicitly named runtime payloads here.
+    # Copy only files, never directories or wildcard build output.
+    sidecar_manifest = source / "packaging" / "windows" / "storytold-sidecars.json"
+    if sidecar_manifest.is_file():
+        try:
+            sidecars = json.loads(sidecar_manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise InstallError(f"invalid runtime sidecar manifest: {sidecar_manifest}: {exc}") from exc
+        if not isinstance(sidecars, list) or any(not isinstance(x, str) for x in sidecars):
+            raise InstallError(f"invalid runtime sidecar manifest: {sidecar_manifest}")
+        for relative in sidecars:
+            rel = Path(relative)
+            if rel.is_absolute() or ".." in rel.parts:
+                raise InstallError(f"unsafe runtime sidecar path: {relative}")
+            src = source / rel
+            if not src.is_file():
+                raise InstallError(f"required runtime sidecar is missing: {src}")
+            destination = stage / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, destination)
+            copied.append(rel.as_posix())
+    return copied
+
+
+@contextlib.contextmanager
+def repo_lock(repo: str, timeout: float = 120.0) -> Iterator[None]:
+    directory = data_root() / repo
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = directory / ".install.lock"
+    deadline = time.monotonic() + timeout
+    handle = lock.open("a+b")
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    acquired = False
+    while not acquired:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (OSError, BlockingIOError):
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise InstallError(f"timed out waiting for another {repo} operation")
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _atomic_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def _verified_remote_sha(repo: str) -> str:
+    node = query_forks([repo])[repo]
+    if node is None:
+        raise InstallError(f"{ACCOUNT}/{repo} is not the expected fork")
+    sha = _validate_remote_node(repo, node, require_branch=True)
+    assert sha is not None
+    return sha
+
+
+def build_repo(root: Path, repo: str) -> str:
+    if not _is_windows():
+        raise InstallError("build is supported only on Windows")
+    if repo not in SUPPORTED:
+        raise InstallError(f"{repo} has no verified Windows source-build recipe")
+    install_base = data_root() / repo
+    logs = install_base / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    target = _host_target()
+    target_dir = install_base / "cargo-target"
+    versions = install_base / "versions"
+    versions.mkdir(parents=True, exist_ok=True)
+    with repo_lock(repo):
+        validate_clone(root, repo)
+        remote_sha = _verified_remote_sha(repo)
+        log_path = logs / f"build-{remote_sha}.log"
+        source_parent = Path(tempfile.mkdtemp(prefix=f"storytold-{repo}-source-"))
+        source = source_parent / "source"
+        stage = install_base / "staging" / uuid.uuid4().hex
+        stage.mkdir(parents=True)
+        try:
+            with log_path.open("w", encoding="utf-8", errors="replace", newline="\n") as log:
+                log.write(f"repository: {ACCOUNT}/{repo}\ncommit: {remote_sha}\ntarget: {target}\n")
+                _run(["git", "init", source])
+                _run(["git", "-C", source, "remote", "add", "origin", f"https://github.com/{ACCOUNT}/{repo}.git"])
+                git_env = os.environ.copy()
+                git_env["GIT_TERMINAL_PROMPT"] = "0"
+                fetch = _run(
+                    ["git", "-C", source, "fetch", "--depth=1", "origin", f"refs/heads/{BRANCH}"],
+                    check=False,
+                    env=git_env,
+                    timeout=300.0,
+                )
+                log.write("$ git fetch --depth=1 origin refs/heads/chey\n" + fetch.stdout + fetch.stderr)
+                if fetch.returncode:
+                    raise InstallError(f"git fetch failed ({fetch.returncode})")
+                fetched = _run(["git", "-C", source, "rev-parse", "FETCH_HEAD"]).stdout.strip()
+                if fetched != remote_sha:
+                    raise InstallError(f"fetched commit {fetched} does not match verified remote commit {remote_sha}")
+                _run(["git", "-C", source, "checkout", "--detach", remote_sha])
+                staged_sha = _run(["git", "-C", source, "rev-parse", "HEAD"]).stdout.strip()
+                if staged_sha != remote_sha:
+                    raise InstallError(f"staged checkout {staged_sha} does not match verified remote commit {remote_sha}")
+                log.write(f"staged checkout: {staged_sha}\n")
+                env = os.environ.copy()
+                env["CARGO_TARGET_DIR"] = str(target_dir)
+                flag_name = "CARGO_TARGET_" + target.upper().replace("-", "_") + "_RUSTFLAGS"
+                env[flag_name] = "-C target-feature=+crt-static"
+                require_name = ("ARTCRAFT_LAUNCHER" if repo == LAUNCHER_REPO else repo.replace("-", "_").upper()) + "_REQUIRE_WINRES"
+                env[require_name] = "1"
+                build_prefix = "ARTCRAFT_LAUNCHER" if repo == LAUNCHER_REPO else repo.replace("-", "_").upper()
+                env[build_prefix + "_BUILD_SHA"] = remote_sha
+                metadata = _load_metadata(source, env, log)
+                declared = _windows_recipe_bins(source, repo) if repo in NORMAL_RECIPES else None
+                packages, binaries = select_packages(metadata, repo, declared)
+                argv = ["cargo", "build", "--release", "--locked", "--target", target]
+                for package_name in packages:
+                    argv.extend(["-p", package_name])
+                log.write("$ " + " ".join(argv) + "\n")
+                returncode = _stream_command(argv, cwd=source, env=env, log=log)
+                if returncode:
+                    raise InstallError(f"Cargo build failed ({returncode})")
+                copied = _copy_payload(source, target_dir / target / "release", stage, binaries)
+                hashes = {relative: hashlib.sha256((stage / relative).read_bytes()).hexdigest() for relative in copied}
+                receipt = {
+                    "schema": 1,
+                    "repo": repo,
+                    "sha": remote_sha,
+                    "executable": f"{binaries[0]}.exe",
+                    "files": copied,
+                    "sha256": hashes,
+                }
+                (stage / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            version = versions / remote_sha
+            if version.exists():
+                existing = version / "receipt.json"
+                try:
+                    existing_value = json.loads(existing.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise InstallError(f"invalid immutable version receipt {existing}: {exc}") from exc
+                if not isinstance(existing_value, dict):
+                    raise InstallError(f"invalid immutable version receipt {existing}: expected an object")
+                _validate_receipt_payload(repo, dict(existing_value), version, existing)
+                if existing_value != receipt:
+                    raise InstallError(f"immutable version directory already exists with different contents: {version}")
+                shutil.rmtree(stage)
+            else:
+                stage.replace(version)
+            _atomic_json(_receipt_path(repo), receipt)
+        except (InstallError, OSError) as exc:
+            raise InstallError(f"{exc}; build log: {log_path}") from exc
+        finally:
+            shutil.rmtree(source_parent, ignore_errors=True)
+            shutil.rmtree(stage, ignore_errors=True)
+    return remote_sha
+
+
+def command_open(repo: str) -> None:
+    if not _is_windows():
+        raise InstallError("open is supported only on Windows")
+    receipt = read_receipt(repo)
+    if receipt is None:
+        raise InstallError(f"{repo} is not installed")
+    flags = (
+        getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+    executable = Path(receipt["_exe"])
+    try:
+        subprocess.Popen(
+            [str(executable)],
+            cwd=executable.parent,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=flags,
+        )
+    except OSError as exc:
+        raise InstallError(f"could not launch {receipt['_exe']}: {exc}") from exc
+    print(f"opened {repo}")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
+    sub = parser.add_subparsers(dest="command", required=True)
+    status = sub.add_parser("status")
+    status.add_argument("repos", nargs="+")
+    for name in ("fork", "build", "open"):
+        command = sub.add_parser(name)
+        command.add_argument("repo")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        root = args.root.resolve()
+        if args.command == "status":
+            repos = [validate_slug(item) for item in args.repos]
+            if len(set(repos)) != len(repos):
+                raise InstallError("duplicate repository slug")
+            print(json.dumps(status_rows(root, repos), separators=(",", ":")))
+        else:
+            repo = validate_slug(args.repo)
+            if args.command == "fork":
+                command_fork(root, repo)
+            elif args.command == "build":
+                sha = build_repo(root, repo)
+                print(f"installed {repo} at {sha}")
+            else:
+                command_open(repo)
+        return 0
+    except InstallError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
