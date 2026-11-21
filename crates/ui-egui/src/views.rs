@@ -1006,6 +1006,9 @@ impl LauncherUi {
     /// The managed download's planned size, or all manual formats for the visitor's platform.
     /// Zero means the source didn't publish a size, not a one-kilobyte download.
     fn download_sizes(&self, entry: &AppEntry) -> Vec<(PackageKind, u64)> {
+        if self.personal.is_some() {
+            return Vec::new();
+        }
         if self.caps.manage_apps {
             return self.backend.download_size(entry.app.id).into_iter().collect();
         }
