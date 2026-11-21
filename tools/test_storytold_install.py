@@ -97,9 +97,11 @@ class InstallerTests(unittest.TestCase):
         rows = json.loads(stdout.getvalue())
         self.assertEqual(["new", "error", "ready"], [row["state"] for row in rows])
         self.assertEqual(
-            {"repo", "state", "remote_sha", "installed_sha", "detail"},
+            {"repo", "state", "remote_sha", "installed_sha", "detail", "build_supported"},
             set(rows[0]),
         )
+        self.assertFalse(rows[0]["build_supported"])
+        self.assertTrue(rows[2]["build_supported"])
         self.assertIsNone(rows[0]["remote_sha"])
         self.assertEqual(SHA_A, rows[2]["remote_sha"])
         self.assertIsNone(rows[2]["installed_sha"])

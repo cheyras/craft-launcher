@@ -59,6 +59,8 @@ struct StatusRecord {
     remote_sha: Option<String>,
     installed_sha: Option<String>,
     detail: String,
+    #[serde(default)]
+    build_supported: bool,
 }
 
 struct Running {
@@ -284,7 +286,9 @@ impl PersonalForks {
                     Some(ForkState::Ready) => {
                         if let Some(record) = status.as_ref() {
                             let same = record.remote_sha.is_some() && record.remote_sha == record.installed_sha;
-                            if same {
+                            if !record.build_supported {
+                                ui.label("Windows build recipe unavailable");
+                            } else if same {
                                 ui.label("Up to date");
                             } else {
                                 let label = if record.installed_sha.is_some() { "Update from chey" } else { "Install from chey" };
@@ -311,11 +315,8 @@ impl PersonalForks {
             }
             ForkState::Ready => {
                 let remote = record.remote_sha.as_deref().map(short_sha).unwrap_or("unknown");
-                let installed = record.installed_sha.as_deref().map(short_sha).unwrap_or("not installed");
+                let installed = record.installed_sha.as_deref().map(short_sha).unwrap_or("Not installed");
                 ui.label(format!("chey {remote} · installed {installed}"));
-                if !record.detail.is_empty() {
-                    ui.label(egui::RichText::new(&record.detail).small());
-                }
             }
             ForkState::Error => {
                 ui.colored_label(ui.visuals().error_fg_color, if record.detail.is_empty() { "Helper reported an error" } else { &record.detail });

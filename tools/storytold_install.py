@@ -290,7 +290,14 @@ def _validate_remote_node(repo: str, node: dict[str, Any], *, require_branch: bo
 
 
 def _row(repo: str, state: str, detail: str, remote: str | None = None, installed: str | None = None) -> dict[str, Any]:
-    return {"repo": repo, "state": state, "remote_sha": remote, "installed_sha": installed, "detail": detail}
+    return {
+        "repo": repo,
+        "state": state,
+        "remote_sha": remote,
+        "installed_sha": installed,
+        "detail": detail,
+        "build_supported": repo in SUPPORTED,
+    }
 
 
 def status_rows(root: Path, repos: Sequence[str]) -> list[dict[str, Any]]:
