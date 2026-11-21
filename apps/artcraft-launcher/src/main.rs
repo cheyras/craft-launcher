@@ -813,10 +813,15 @@ impl Launcher {
         }
         self.waker = Some(waker.clone());
         #[cfg(windows)]
-        self.forks.start({
-            let waker = waker.clone();
-            Arc::new(move || waker.wake())
-        });
+        {
+            if self.forks.enabled() {
+                self.ui.enable_personal_mode();
+            }
+            self.forks.start({
+                let waker = waker.clone();
+                Arc::new(move || waker.wake())
+            });
+        }
         let (wake, on_quit) = (waker.clone(), waker.clone());
         match tray::Tray::new(move || wake.wake(), move || on_quit.quit_from_tray()) {
             Ok(t) => self.tray = Some(t),
@@ -874,13 +879,16 @@ impl Launcher {
     /// The work that goes on with or without a window. Returns what the user asked for.
     fn tick(&mut self, ctx: &egui::Context) -> Vec<Request> {
         #[cfg(windows)]
-        self.forks.tick();
-        #[cfg(windows)]
-        let saved_auto_update = if self.forks.personal() { Some(std::mem::replace(&mut self.ui.settings.auto_update, false)) } else { None };
+        {
+            self.forks.tick();
+            if self.forks.enabled() {
+                self.ui.set_personal_status(self.forks.ui_rows(), self.forks.working(), self.forks.status_known(), self.forks.message());
+            }
+        }
         self.ui.logic(ctx, &mut self.host);
         #[cfg(windows)]
-        if let Some(saved) = saved_auto_update {
-            self.ui.settings.auto_update = saved;
+        for request in self.ui.take_personal_requests() {
+            self.forks.submit(request);
         }
         let mut requests = Vec::new();
         let starts: Vec<single_instance::Request> = self.starts.try_iter().collect();
@@ -1159,17 +1167,6 @@ impl eframe::App for Shell<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        #[cfg(windows)]
-        if self.launcher.forks.personal() {
-            let release_busy = self.launcher.ui.busy();
-            self.launcher.forks.draw_header(ui.ctx());
-            self.launcher.forks.draw_personal(ui.ctx(), release_busy);
-            self.launcher.forks.draw_switch(ui.ctx());
-        } else {
-            self.launcher.ui.ui(ui, &mut self.launcher.host);
-            self.launcher.forks.draw_switch(ui.ctx());
-        }
-        #[cfg(not(windows))]
         self.launcher.ui.ui(ui, &mut self.launcher.host);
         ui.ctx().output_mut(|o| {
             o.commands.retain(|cmd| {

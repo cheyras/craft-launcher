@@ -218,6 +218,8 @@ pub struct LauncherUi {
     /// Toasts created from logic (which may run with an old input time) or the UI. Their expiry is
     /// fixed when the next `ui` pass actually shows them.
     pending_toasts: Vec<(String, bool)>,
+    /// Optional native-only source-build adapter. Ordinary LauncherUi instances keep this `None`.
+    pub(crate) personal: Option<crate::personal::PersonalMode>,
     /// While the user drags a pin handle: dragged catalog id and the pinned order at drag start
     /// (so Escape can restore it after live mid-drag reorders).
     pub(crate) pin_dragging: Option<(String, Vec<String>)>,
@@ -318,6 +320,7 @@ impl LauncherUi {
             frame: None,
             flushed: Vec::new(),
             pending_toasts: Vec::new(),
+            personal: None,
             pin_dragging: None,
         }
     }
@@ -361,6 +364,10 @@ impl LauncherUi {
 
     /// Looks for updates now (the tray's "Check for Updates").
     pub fn check_now(&mut self) {
+        if let Some(personal) = &mut self.personal {
+            personal.requests.push(crate::PersonalRequest::Refresh);
+            return;
+        }
         self.auto_update_attempted.clear();
         self.backend.send(Command::CheckForUpdates { force: true });
         self.backend.send(Command::Detect);
@@ -368,7 +375,9 @@ impl LauncherUi {
     }
 
     pub(crate) fn send(&mut self, command: Command) {
-        self.backend.send(command);
+        if !self.dispatch_personal(command.clone()) {
+            self.backend.send(command);
+        }
     }
 
     /// The toolbar's check button. The side effects run once, when the pass flushes.
@@ -415,7 +424,11 @@ impl LauncherUi {
                 continue;
             }
             match action {
-                UiAction::Command(command) => self.backend.send(command.clone()),
+                UiAction::Command(command) => {
+                    if !self.dispatch_personal(command.clone()) {
+                        self.backend.send(command.clone());
+                    }
+                }
                 UiAction::Launch(id) => {
                     let flags = self.settings.launch_flags.get(id).map_or("", String::as_str);
                     // The dialog only saves flags that split, but the settings file can be edited by hand.
@@ -426,11 +439,20 @@ impl LauncherUi {
                         self.flushed.push(action.clone());
                         continue;
                     };
+                    if self.dispatch_personal(Command::Launch { app: id.clone(), args: args.clone() }) {
+                        self.flushed.push(action.clone());
+                        continue;
+                    }
                     let opened = self.settings.launches.entry(id.clone()).or_insert(0);
                     *opened = opened.saturating_add(1);
                     self.backend.send(Command::Launch { app: id.clone(), args });
                 }
                 UiAction::CheckNow => {
+                    if let Some(personal) = &mut self.personal {
+                        personal.requests.push(crate::PersonalRequest::Refresh);
+                        self.flushed.push(action.clone());
+                        continue;
+                    }
                     self.auto_update_attempted.clear();
                     self.backend.send(Command::CheckForUpdates { force: true });
                     self.backend.send(Command::Detect);
@@ -440,6 +462,82 @@ impl LauncherUi {
             }
             self.flushed.push(action.clone());
         }
+    }
+
+    /// Final mutation boundary for configured source-build mode. Returns true when the command
+    /// was consumed (including deliberately refused official/community actions).
+    fn dispatch_personal(&mut self, command: Command) -> bool {
+        let Some(personal) = &mut self.personal else { return false };
+        match command {
+            Command::Install { app } | Command::Replace { app, .. } => {
+                if let Some(row) = personal.any_row(&app).cloned()
+                    && !personal.busy
+                    && personal.status_known
+                    && row.build_supported
+                    && row.state != crate::PersonalState::Error
+                {
+                    personal.requests.push(crate::PersonalRequest::Install { repo: row.repo });
+                }
+            }
+            Command::InstallAll { apps } => {
+                let repos = apps
+                    .iter()
+                    .filter_map(|id| personal.row(id))
+                    .filter(|r| r.state == crate::PersonalState::Ready && r.installed_sha.is_some() && r.remote_sha != r.installed_sha)
+                    .map(|r| r.repo.clone())
+                    .collect();
+                personal.requests.push(crate::PersonalRequest::UpdateAll { repos });
+            }
+            Command::Launch { app, args } => {
+                if let Some(row) = personal.any_row(&app).cloned()
+                    && !personal.busy
+                    && personal.status_known
+                    && row.installed_sha.is_some()
+                {
+                    personal.requests.push(crate::PersonalRequest::Open { repo: row.repo, args });
+                }
+            }
+            Command::UpdateLauncher => {
+                if let Some(row) = personal.launcher().cloned()
+                    && !personal.busy
+                    && personal.status_known
+                    && row.build_supported
+                    && row.state != crate::PersonalState::Error
+                {
+                    personal.requests.push(crate::PersonalRequest::Install { repo: row.repo });
+                }
+            }
+            Command::CheckForUpdates { .. } | Command::Detect => personal.requests.push(crate::PersonalRequest::Refresh),
+            Command::FetchScreenshots { .. }
+            | Command::Configure(_)
+            | Command::DownloadOrder(_)
+            | Command::McpState
+            | Command::McpSetAgents { .. }
+            | Command::McpSetClient { .. }
+            | Command::McpRestartClient { .. } => return false,
+            Command::ListVersions { .. }
+            | Command::Uninstall { .. }
+            | Command::Reveal { .. }
+            | Command::CreateDesktopShortcut { .. }
+            | Command::Pause { .. }
+            | Command::Cancel { .. } => {}
+        }
+        true
+    }
+
+    /// Enables the native source-build adapter. This is never called by the web or normal shell.
+    pub fn enable_personal_mode(&mut self) {
+        self.personal.get_or_insert_with(Default::default);
+    }
+
+    pub fn set_personal_status(&mut self, rows: Vec<crate::PersonalApp>, busy: bool, status_known: bool, message: Option<(String, bool)>) {
+        if let Some(personal) = &mut self.personal {
+            personal.replace(rows, busy, status_known, message);
+        }
+    }
+
+    pub fn take_personal_requests(&mut self) -> Vec<crate::PersonalRequest> {
+        self.personal.as_mut().map_or_else(Vec::new, |p| std::mem::take(&mut p.requests))
     }
 
     /// Queues a message for the next pass that can actually draw. Its age is deliberately not
@@ -522,6 +620,10 @@ impl LauncherUi {
     /// installed, it opens the folder dialog and sends nothing until that is confirmed; otherwise
     /// it queues `Install` immediately, including for an already installed app (update/reinstall).
     pub(crate) fn install_app(&mut self, id: &str) {
+        if self.personal.is_some() {
+            self.act_command(Command::Install { app: id.to_string() });
+            return;
+        }
         if !self.custom_install_folders() || self.entry(id).is_some_and(|e| e.installed.is_some()) {
             self.act_command(Command::Install { app: id.to_string() });
             return;
@@ -535,6 +637,10 @@ impl LauncherUi {
         // Messages made here (toasts, alerts) are drawn later, so use the language the UI can
         // actually show: English where the system has no CJK face for the preference.
         set_current(effective_lang(&self.settings.language));
+        if self.personal.is_some() {
+            self.personal_logic(ctx, host);
+            return;
+        }
         self.configure();
         // A kept version's card notes a newer release; that needs the app's published list.
         self.request_pinned_lists();
@@ -579,6 +685,58 @@ impl LauncherUi {
         ctx.request_repaint_after(Duration::from_secs(60));
     }
 
+    pub(crate) fn entry_status(&self, entry: &AppEntry) -> AppStatus {
+        let Some(personal) = &self.personal else {
+            return entry.status(self.platform, self.caps.manage_apps);
+        };
+        if entry.app.kind == artcraft_launcher_core::catalog::AppKind::Community {
+            return AppStatus::Unavailable;
+        }
+        if !personal.status_known {
+            return AppStatus::Checking;
+        }
+        let Some(row) = personal.row(entry.app.id) else { return AppStatus::Unavailable };
+        match row.state {
+            crate::PersonalState::New | crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch => AppStatus::Available,
+            crate::PersonalState::Error => AppStatus::Unavailable,
+            crate::PersonalState::Ready if row.installed_sha.is_none() => AppStatus::Available,
+            crate::PersonalState::Ready if row.remote_sha != row.installed_sha => AppStatus::UpdateAvailable,
+            crate::PersonalState::Ready => AppStatus::UpToDate,
+        }
+    }
+
+    fn personal_logic(&mut self, ctx: &egui::Context, host: &mut dyn Host) {
+        if !self.started {
+            self.started = true;
+            self.last_detect = self.backend.now();
+        }
+        let now = self.backend.now();
+        if now.saturating_sub(self.last_detect) >= RESCAN_EVERY {
+            self.last_detect = now;
+            if let Some(personal) = &mut self.personal {
+                personal.requests.push(crate::PersonalRequest::Refresh);
+            }
+        }
+        for event in self.backend.poll() {
+            match event {
+                Event::CatalogUpdated => {
+                    self.handle(Event::CatalogUpdated);
+                }
+                Event::Screenshot { app, key, result } => {
+                    self.pictures.insert((app, key), crate::details::Picture::from_result(result));
+                }
+                Event::Mcp { agents } => self.mcp_agents = agents,
+                Event::McpError { message } => self.toast(message, true),
+                _ => {}
+            }
+        }
+        if self.restart_requested {
+            self.restart_requested = false;
+            host.quit();
+        }
+        ctx.request_repaint_after(Duration::from_secs(60));
+    }
+
     /// Returns whether app state changed.
     fn handle(&mut self, event: Event) -> bool {
         match event {
@@ -591,7 +749,11 @@ impl LauncherUi {
                     }
                 }
                 self.entries.sort_by_key(|entry| artcraft_launcher_core::hosted_catalog::apps().iter().position(|app| app.id == entry.app.id));
-                self.backend.send(Command::Detect);
+                if let Some(personal) = &mut self.personal {
+                    personal.requests.push(crate::PersonalRequest::Refresh);
+                } else {
+                    self.backend.send(Command::Detect);
+                }
                 true
             }
             Event::Latest { app, latest, from } => {
@@ -1000,8 +1162,6 @@ impl LauncherUi {
                     && (needle.is_empty() || e.app.name.to_lowercase().contains(&needle) || e.app.tagline.to_lowercase().contains(&needle))
             })
             .collect();
-        let platform = self.platform;
-        let manage = self.caps.manage_apps;
         // The grid offers its own few orders (`views::grid_sort_now`); the table sorts by its columns.
         let grid = self.settings.view == ViewMode::Grid;
         let (sort, desc) = if grid { crate::views::grid_sort_now(&self.settings) } else { (self.settings.sort, self.settings.sort_descending) };
@@ -1022,9 +1182,7 @@ impl LauncherUi {
             let ord = match sort {
                 SortKey::Suite => dir(ia.cmp(ib)),
                 SortKey::Name => dir(a.app.name.cmp(b.app.name)),
-                SortKey::Status => {
-                    dir(crate::model::status_rank(&a.status(platform, manage)).cmp(&crate::model::status_rank(&b.status(platform, manage))))
-                }
+                SortKey::Status => dir(crate::model::status_rank(&self.entry_status(a)).cmp(&crate::model::status_rank(&self.entry_status(b)))),
                 SortKey::Installed => {
                     let (x, y) = (installed(a), installed(b));
                     opt(x.as_ref().zip(y.as_ref()).map(|(x, y)| x.cmp_precedence(y)), x.is_some(), y.is_some())
@@ -1049,7 +1207,7 @@ impl LauncherUi {
         // The grid shows installed apps first among the unpinned set, then the rest under
         // "Not installed" (the sort holds within each group; the sort is stable).
         if grid {
-            rest.sort_by_key(|(_, e)| !e.status(platform, manage).is_installed());
+            rest.sort_by_key(|(_, e)| !self.entry_status(e).is_installed());
         }
         list = pinned;
         list.append(&mut rest);
@@ -1063,7 +1221,7 @@ impl LauncherUi {
 
     /// Whether the app on screen under `id` is installed on this computer.
     pub(crate) fn is_installed(&self, id: &str) -> bool {
-        self.entry(id).is_some_and(|e| e.status(self.platform, self.caps.manage_apps).is_installed())
+        self.entry(id).is_some_and(|e| self.entry_status(e).is_installed())
     }
 
     /// "ArtCraft API", "GitHub" or "ArtCraft API and GitHub": the services behind the releases on
@@ -1096,7 +1254,7 @@ impl LauncherUi {
     /// Whether `entry` belongs in `filter`. Hidden apps stay out of every list except Hidden.
     pub(crate) fn in_filter(&self, entry: &AppEntry, filter: Filter) -> bool {
         let hidden = self.settings.hidden.contains(entry.app.id);
-        let status = entry.status(self.platform, self.caps.manage_apps);
+        let status = self.entry_status(entry);
         match filter {
             Filter::Hidden => hidden,
             Filter::All => !hidden,
@@ -1210,6 +1368,73 @@ mod tests {
         (LauncherUi::new(&ctx, Box::new(backend), settings), sent, ctx)
     }
 
+    #[test]
+    fn ordinary_launcher_ui_has_no_personal_mode() {
+        let (ui, _, _) = launcher();
+        assert!(ui.personal.is_none());
+    }
+
+    #[test]
+    fn enabling_personal_mode_preserves_stock_preferences() {
+        let (mut ui, _, _) = launcher();
+        ui.settings.auto_update = true;
+        ui.settings.versions.insert("anicraft".into(), artcraft_launcher_core::protocol::VersionTrack::Pinned("v1.2.3".into()));
+        ui.enable_personal_mode();
+        assert!(ui.settings.auto_update);
+        assert_eq!(ui.settings.versions.get("anicraft"), Some(&artcraft_launcher_core::protocol::VersionTrack::Pinned("v1.2.3".into())));
+    }
+
+    #[test]
+    fn personal_dispatch_routes_new_update_open_and_refuses_unavailable() {
+        let (mut ui, sent, _) = launcher();
+        ui.enable_personal_mode();
+        let row = |id: &str, repo: &str, state, remote: Option<&str>, installed: Option<&str>, supported| crate::PersonalApp {
+            id: id.into(),
+            repo: repo.into(),
+            state,
+            remote_sha: remote.map(str::to_string),
+            installed_sha: installed.map(str::to_string),
+            detail: String::new(),
+            build_supported: supported,
+        };
+        ui.set_personal_status(
+            vec![
+                row("photocraft", "photocraft", crate::PersonalState::New, None, None, true),
+                row("anicraft", "anicraft", crate::PersonalState::Ready, Some("bbbbbbbbbbbbbbbb"), Some("aaaaaaaaaaaaaaaa"), true),
+                row("texturecraft", "texturecraft", crate::PersonalState::Ready, Some("cccccccccccccccc"), Some("cccccccccccccccc"), true),
+                row("materialcraft", "materialcraft", crate::PersonalState::Error, None, None, false),
+                row(
+                    artcraft_launcher_core::catalog::LAUNCHER_ID,
+                    "craft-launcher",
+                    crate::PersonalState::Ready,
+                    Some("eeeeeeeeeeeeeeee"),
+                    Some("dddddddddddddddd"),
+                    true,
+                ),
+            ],
+            false,
+            true,
+            None,
+        );
+        assert!(ui.dispatch_personal(Command::Install { app: "photocraft".into() }));
+        assert!(ui.dispatch_personal(Command::Install { app: "anicraft".into() }));
+        assert!(ui.dispatch_personal(Command::Launch { app: "texturecraft".into(), args: vec!["--safe".into()] }));
+        assert!(ui.dispatch_personal(Command::Install { app: "materialcraft".into() }));
+        assert!(ui.dispatch_personal(Command::InstallAll { apps: vec!["photocraft".into(), "anicraft".into(), "texturecraft".into()] }));
+        assert!(ui.dispatch_personal(Command::UpdateLauncher));
+        assert_eq!(
+            ui.take_personal_requests(),
+            vec![
+                crate::PersonalRequest::Install { repo: "photocraft".into() },
+                crate::PersonalRequest::Install { repo: "anicraft".into() },
+                crate::PersonalRequest::Open { repo: "texturecraft".into(), args: vec!["--safe".into()] },
+                crate::PersonalRequest::UpdateAll { repos: vec!["anicraft".into()] },
+                crate::PersonalRequest::Install { repo: "craft-launcher".into() },
+            ]
+        );
+        assert!(sent.borrow().is_empty(), "no official backend command may cross the personal boundary");
+    }
+
     /// One `run_ui` pass at a chosen input time, exactly like the native shell's callback order.
     fn frame(launcher: &mut LauncherUi, ctx: &egui::Context, time: f64) {
         let input = egui::RawInput {
@@ -1241,6 +1466,15 @@ mod tests {
         );
         assert!(ui.entry(id).unwrap().detected);
         assert_eq!(sent.borrow().as_slice(), &[Command::Detect]);
+    }
+
+    #[test]
+    fn personal_catalog_event_refreshes_verified_helper_without_detecting_stock_installs() {
+        let (mut ui, sent, _) = launcher();
+        ui.enable_personal_mode();
+        assert!(ui.handle(Event::CatalogUpdated));
+        assert_eq!(ui.take_personal_requests(), vec![crate::PersonalRequest::Refresh]);
+        assert!(sent.borrow().is_empty());
     }
 
     /// The last screen order sent to the backend for its download queue.

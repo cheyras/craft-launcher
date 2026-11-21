@@ -1,21 +1,25 @@
-# Personal forks on Windows
+# Storytold forks on Windows
 
-The Windows desktop launcher has a **Personal forks / Official releases** switch. Personal forks is the default when `storytold_install.py` exists in the configured personal root, or when `STORYTOLD_FORKS_ROOT` is explicitly set. Official releases keeps the normal signed ArtCraft release view and trust rules.
+The Windows launcher uses the normal ArtCraft launcher interface—header, cards, table, details, toolbar, pinning, settings, menus, typography, and theme—when the Storytold helper is configured. There is no separate personal screen or mode switch.
 
-The default personal root is:
+Personal source mode is enabled only when `storytold_install.py` exists in the default root, or `STORYTOLD_FORKS_ROOT` is explicitly set. Without that configuration, Windows behaves like the ordinary launcher. Non-Windows and web builds are unchanged.
+
+The default root is:
 
 ```text
 E:\Users\cheyr\storytold forks
 ```
 
-When setting up elsewhere, copy both `tools/storytold_forks.py` and `tools/storytold_install.py` into the parent directory, then put them at `E:\Users\cheyr\storytold forks\storytold_forks.py` and `E:\Users\cheyr\storytold forks\storytold_install.py`. Set `STORYTOLD_FORKS_ROOT` to use another root and `STORYTOLD_PYTHON` to use another Python executable; the default executable is `python.exe`.
+`STORYTOLD_PYTHON` can select another Python executable; the default is `python.exe`. The launcher invokes the sibling helper with `python -B` and the configured root.
 
-Personal rows come from the live, verified launcher catalog's official `storytold/` repositories, plus the launcher repository `craft-launcher`. The helper reports and operates on the owner's `origin/chey` branch. Community repositories are not included. Refresh only reads status and never installs or updates anything.
+The helper is the authority for official catalog repositories and the launcher repository (`craft-launcher`). Status reads the live full `origin/chey` commit and the managed install receipt. Cards may display a short commit, but actions are routed by validated catalog repository slug and the helper verifies the effective repository and branch.
 
-Fork, Clone, Create chey branch, Install from chey, and Update from chey are explicit actions. Personal builds install side by side according to the helper's per-repository build and install rules. The displayed commit identifies the `origin/chey` source and the installed commit so a row can distinguish Install from chey, Update from chey, and Up to date. Open launches an installed personal app through the helper.
+- A missing fork has the existing **New** badge and a primary **Fork and install** button.
+- A missing clone or `chey` branch uses the same install action; the helper completes bootstrap, clone, branch preparation, build, and install in one idempotent operation.
+- Installed builds use the normal **Open** and **Update** card behavior.
+- **Update all** queues installed personal builds one at a time and skips new repositories.
+- Community apps remain visible for their information and links, but source-mode install management is disabled for them.
 
-The supported Windows source-build recipes are AniCraft, TextureCraft, MaterialCraft, and Craft Anything, plus the Storytold Launcher. Other official catalog apps can still be discovered and forked, but may need a Windows build recipe before they can be built locally.
+Mutations fail closed until a complete helper status response is known. Only one repository mutation runs at a time, helper work stays off the GUI thread, and later queued updates continue after a failure. Refresh is read-only. Errors are shown in the launcher and point to the launcher log for full diagnostics.
 
-Automatic official installations are suspended in Personal forks mode. Use Official releases explicitly to see and manage signed upstream releases.
-
-After installing or updating the launcher itself, fully exit the running launcher, then reopen it using the **Storytold Launcher** shortcut. The current process does not open the replacement in place.
+Official app releases are never installed from personal source mode: install, version picker, details, update-all, automatic-update, and final command dispatch all route through or are blocked by the personal adapter. The normal built-in launcher self-update surface remains available. After a helper-built Storytold Launcher is installed, fully quit the running launcher and start it again from the Storytold Launcher shortcut.

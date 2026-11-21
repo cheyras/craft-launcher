@@ -100,7 +100,7 @@ class InstallerTests(unittest.TestCase):
             {"repo", "state", "remote_sha", "installed_sha", "detail", "build_supported"},
             set(rows[0]),
         )
-        self.assertFalse(rows[0]["build_supported"])
+        self.assertTrue(rows[0]["build_supported"])
         self.assertTrue(rows[2]["build_supported"])
         self.assertIsNone(rows[0]["remote_sha"])
         self.assertEqual(SHA_A, rows[2]["remote_sha"])
@@ -212,8 +212,110 @@ class InstallerTests(unittest.TestCase):
             (["anicraft", "anicraft-worker", "anicraft-cli"], ["anicraft", "anicraft-worker", "anicraft-cli"]),
             install.select_packages(metadata, "anicraft", ["anicraft", "anicraft-worker"]),
         )
-        with self.assertRaisesRegex(install.InstallError, "no verified"):
-            install.select_packages(metadata, "photocraft")
+        with self.assertRaisesRegex(install.InstallError, "requires package and binary"):
+            install.select_packages(metadata, "historically-unsupported")
+
+        photo = {"packages": [
+            {"name": "photocraft", "targets": [{"name": "photocraft", "kind": ["bin"]}]},
+            {"name": "photocraft-cli", "targets": [{"name": "photocraft-cli", "kind": ["bin"]}]},
+        ]}
+        self.assertEqual(
+            (["photocraft", "photocraft-cli"], ["photocraft", "photocraft-cli"]),
+            install.select_packages(photo, "photocraft"),
+        )
+
+    def test_recipe_declarations_and_required_script(self):
+        source = self.root / "recipe"
+        windows = source / "packaging" / "windows"
+        windows.mkdir(parents=True)
+        script = windows / "package.ps1"
+        script.write_text("$Bins = @('figcraft', 'figcraft-cli')\n", encoding="utf-8")
+        self.assertEqual(["figcraft", "figcraft-cli"], install._require_windows_recipe(source, "figcraft"))
+        script.write_text("$Bins = 'effectcraft', 'effectcraft-cli'\n", encoding="utf-8")
+        self.assertEqual(
+            ["effectcraft", "effectcraft-cli"], install._require_windows_recipe(source, "effectcraft")
+        )
+        script.unlink()
+        with self.assertRaisesRegex(install.InstallError, "no documented Windows packaging recipe"):
+            install._require_windows_recipe(source, "effectcraft")
+
+    def test_special_recipe_feature_flags(self):
+        target = "x86_64-pc-windows-msvc"
+        photo = install._cargo_build_argv("photocraft", ["photocraft", "photocraft-cli"], target)
+        light = install._cargo_build_argv("lightcraft", ["lightcraft", "lightcraft-cli"], target)
+        ordinary = install._cargo_build_argv("designcraft", ["designcraft", "designcraft-cli"], target)
+        self.assertEqual("heif", photo[photo.index("--features") + 1])
+        self.assertEqual("lightcraft/heif,lightcraft-cli/heif", light[light.index("--features") + 1])
+        self.assertNotIn("--features", ordinary)
+
+    def test_install_bootstraps_incomplete_states_then_builds(self):
+        for state in ("new", "needs-clone", "needs-branch"):
+            with self.subTest(state=state), mock.patch.object(
+                install, "status_rows", return_value=[{"state": state, "detail": state}]
+            ), mock.patch.object(install, "_bootstrap") as bootstrap, mock.patch.object(
+                install, "build_repo", return_value=SHA_B
+            ) as build:
+                self.assertEqual(SHA_B, install.install_repo(self.root, "anicraft"))
+                bootstrap.assert_called_once_with(self.root, "anicraft")
+                build.assert_called_once_with(self.root, "anicraft")
+
+    def test_install_ready_builds_directly_and_hard_error_stops(self):
+        with mock.patch.object(
+            install, "status_rows", return_value=[{"state": "ready", "detail": "ready"}]
+        ), mock.patch.object(install, "_bootstrap") as bootstrap, mock.patch.object(
+            install, "build_repo", return_value=SHA_B
+        ) as build:
+            self.assertEqual(SHA_B, install.install_repo(self.root, "anicraft"))
+            bootstrap.assert_not_called()
+            build.assert_called_once()
+        with mock.patch.object(
+            install, "status_rows", return_value=[{"state": "error", "detail": "authentication failed"}]
+        ), mock.patch.object(install, "_bootstrap") as bootstrap, mock.patch.object(
+            install, "build_repo"
+        ) as build:
+            with self.assertRaisesRegex(install.InstallError, "status stage.*authentication failed"):
+                install.install_repo(self.root, "anicraft")
+            bootstrap.assert_not_called()
+            build.assert_not_called()
+
+    def test_install_cli_dispatches_and_reports_installed_sha(self):
+        stdout = io.StringIO()
+        with mock.patch.object(install, "install_repo", return_value=SHA_B) as command, contextlib.redirect_stdout(
+            stdout
+        ):
+            code = install.main(["--root", str(self.root), "install", "anicraft"])
+        self.assertEqual(0, code)
+        command.assert_called_once_with(self.root.resolve(), "anicraft")
+        self.assertEqual(f"installed anicraft at {SHA_B}\n", stdout.getvalue())
+
+    def test_install_retry_resumes_after_bootstrap_and_build_failures(self):
+        rows = [
+            [{"state": "new", "detail": "new"}],
+            [{"state": "needs-clone", "detail": "saved fork"}],
+        ]
+        with mock.patch.object(install, "status_rows", side_effect=rows), mock.patch.object(
+            install, "_bootstrap", side_effect=[install.InstallError("fork failed"), None]
+        ) as bootstrap, mock.patch.object(install, "build_repo", return_value=SHA_B) as build:
+            with self.assertRaisesRegex(install.InstallError, "bootstrap stage.*fork failed"):
+                install.install_repo(self.root, "anicraft")
+            self.assertEqual(SHA_B, install.install_repo(self.root, "anicraft"))
+            self.assertEqual(2, bootstrap.call_count)
+            build.assert_called_once()
+
+        rows = [
+            [{"state": "needs-branch", "detail": "branch"}],
+            [{"state": "ready", "detail": "saved clone"}],
+        ]
+        with mock.patch.object(install, "status_rows", side_effect=rows), mock.patch.object(
+            install, "_bootstrap"
+        ) as bootstrap, mock.patch.object(
+            install, "build_repo", side_effect=[install.InstallError("compiler failed"), SHA_B]
+        ) as build:
+            with self.assertRaisesRegex(install.InstallError, "build stage.*compiler failed"):
+                install.install_repo(self.root, "anicraft")
+            self.assertEqual(SHA_B, install.install_repo(self.root, "anicraft"))
+            bootstrap.assert_called_once()
+            self.assertEqual(2, build.call_count)
 
     def _fake_build_run(self, fail_cargo=False):
         def run(argv, **kwargs):
@@ -245,7 +347,7 @@ class InstallerTests(unittest.TestCase):
             install, "_run", side_effect=self._fake_build_run()
         ), mock.patch.object(install, "_load_metadata", side_effect=self._metadata), mock.patch.object(
             install, "_copy_payload", side_effect=self._copy
-        ), mock.patch.object(
+        ), mock.patch.object(install, "_require_windows_recipe", return_value=None), mock.patch.object(
             install, "_stream_command", return_value=0
         ):
             installed = install.build_repo(self.root, "anicraft")
@@ -255,6 +357,91 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(
             (self.local / "StorytoldForks" / "anicraft" / "versions" / SHA_B / "anicraft.exe").is_file()
         )
+
+    def test_build_same_sha_valid_receipt_skips_fetch_and_compile(self):
+        clone = self.root / "anicraft"
+        clone.mkdir()
+        version = self.local / "StorytoldForks" / "anicraft" / "versions" / SHA_B
+        version.mkdir(parents=True)
+        executable = version / "anicraft.exe"
+        executable.write_bytes(b"verified active bytes")
+        receipt = {
+            "schema": 1,
+            "repo": "anicraft",
+            "sha": SHA_B,
+            "executable": "anicraft.exe",
+            "files": ["anicraft.exe"],
+            "sha256": {"anicraft.exe": install.hashlib.sha256(executable.read_bytes()).hexdigest()},
+        }
+        (version.parents[1] / "active.json").write_text(json.dumps(receipt), encoding="utf-8")
+        with mock.patch.object(install, "_is_windows", return_value=True), mock.patch.object(
+            install, "validate_clone", return_value=clone
+        ), mock.patch.object(install, "_verified_remote_sha", return_value=SHA_B) as remote, mock.patch.object(
+            install, "_run", side_effect=AssertionError("fast path fetched source")
+        ), mock.patch.object(
+            install, "_stream_command", side_effect=AssertionError("fast path compiled source")
+        ):
+            self.assertEqual(SHA_B, install.build_repo(self.root, "anicraft"))
+        remote.assert_called_once_with("anicraft")
+
+    def test_pdfcraft_stages_verified_models_and_not_partial_files(self):
+        source = self.root / "pdfcraft-source"
+        source.mkdir()
+        stage = self.root / "stage"
+        stage.mkdir()
+        model_bytes = b"model data"
+        licence_bytes = b"licence text"
+        (source / "ATTRIBUTION.toml").write_text(
+            "\n".join([
+                "[[fetched]]",
+                'file = "ocr.rten"',
+                'kind = "model"',
+                f'sha256 = "{install.hashlib.sha256(model_bytes).hexdigest()}"',
+                f'licence_sha256 = "{install.hashlib.sha256(licence_bytes).hexdigest()}"',
+            ]),
+            encoding="utf-8",
+        )
+
+        def fake_models(argv, **kwargs):
+            models = Path(argv[-1])
+            (models / "ocr.rten").write_bytes(model_bytes)
+            (models / "ocr.rten.LICENCE.txt").write_bytes(licence_bytes)
+            (models / "ATTRIBUTION.txt").write_text("OCR attribution\n", encoding="utf-8")
+            (models / "abandoned.part").write_bytes(b"partial")
+            return 0
+
+        with mock.patch.object(install, "_stream_command", side_effect=fake_models) as stream:
+            copied = install._stage_pdfcraft_models(source, stage, {"CARGO_TARGET_DIR": "dedicated"}, io.StringIO())
+        self.assertEqual(
+            ["models/ATTRIBUTION.txt", "models/ocr.rten", "models/ocr.rten.LICENCE.txt"], copied
+        )
+        self.assertFalse((stage / "models" / "abandoned.part").exists())
+        self.assertEqual(["cargo", "xtask", "models", os.fspath(stage / "models")], stream.call_args.args[0])
+        self.assertEqual(source, stream.call_args.kwargs["cwd"])
+        self.assertEqual("dedicated", stream.call_args.kwargs["env"]["CARGO_TARGET_DIR"])
+
+    def test_pdfcraft_model_failure_is_logged(self):
+        source = self.root / "source"
+        source.mkdir()
+        model_digest = install.hashlib.sha256(b"model").hexdigest()
+        licence_digest = install.hashlib.sha256(b"licence").hexdigest()
+        (source / "ATTRIBUTION.toml").write_text(
+            "\n".join([
+                "[[fetched]]",
+                'file = "ocr.rten"',
+                'kind = "model"',
+                f'sha256 = "{model_digest}"',
+                f'licence_sha256 = "{licence_digest}"',
+            ]),
+            encoding="utf-8",
+        )
+        stage = self.root / "failed-stage"
+        stage.mkdir()
+        log = io.StringIO()
+        with mock.patch.object(install, "_stream_command", return_value=7):
+            with self.assertRaisesRegex(install.InstallError, "xtask models failed"):
+                install._stage_pdfcraft_models(source, stage, {}, log)
+        self.assertIn("cargo xtask models", log.getvalue())
 
     def test_failed_update_does_not_replace_active_receipt(self):
         app = self.local / "StorytoldForks" / "anicraft"
@@ -276,7 +463,8 @@ class InstallerTests(unittest.TestCase):
         ), mock.patch.object(install, "_verified_remote_sha", return_value=SHA_B), mock.patch.object(
             install, "_run", side_effect=self._fake_build_run(fail_cargo=True)
         ), mock.patch.object(install, "_load_metadata", side_effect=self._metadata), mock.patch.object(
-            install, "_stream_command", return_value=1
+            install, "_require_windows_recipe", return_value=None
+        ), mock.patch.object(install, "_stream_command", return_value=1
         ):
             with self.assertRaisesRegex(install.InstallError, "build log"):
                 install.build_repo(self.root, "anicraft")
@@ -294,6 +482,40 @@ class InstallerTests(unittest.TestCase):
             [install.sys.executable, sibling, "--root", self.root, "bootstrap", "anicraft"],
             run.call_args.args[0],
         )
+
+    def test_open_forwards_exact_args_after_separator(self):
+        executable = self.local / "StorytoldForks" / "anicraft" / "versions" / SHA_A / "anicraft.exe"
+        receipt = {"_exe": str(executable)}
+        with mock.patch.object(install, "_is_windows", return_value=True), mock.patch.object(
+            install, "read_receipt", return_value=receipt
+        ), mock.patch.object(install.subprocess, "Popen") as popen, contextlib.redirect_stdout(io.StringIO()):
+            code = install.main([
+                "--root", str(self.root), "open", "anicraft", "--", "--profile", "name with spaces", "-x-y"
+            ])
+        self.assertEqual(0, code)
+        self.assertEqual(
+            [str(executable), "--profile", "name with spaces", "-x-y"], popen.call_args.args[0]
+        )
+        self.assertEqual(executable.parent, popen.call_args.kwargs["cwd"])
+        self.assertTrue(popen.call_args.kwargs["close_fds"])
+
+    def test_open_rejects_ambiguous_args_without_separator(self):
+        with mock.patch.object(install, "command_open") as command:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = install.main(["--root", str(self.root), "open", "anicraft", "--profile"])
+        self.assertEqual(2, code)
+        self.assertIn("require '--' separator", stderr.getvalue())
+        command.assert_not_called()
+
+    def test_open_rejects_args_before_separator(self):
+        with mock.patch.object(install, "command_open") as command:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = install.main(["--root", str(self.root), "open", "anicraft", "before", "--", "after"])
+        self.assertEqual(2, code)
+        self.assertIn("must follow '--' separator", stderr.getvalue())
+        command.assert_not_called()
 
 
 if __name__ == "__main__":

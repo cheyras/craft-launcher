@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -34,9 +35,11 @@ GITHUB_URL_RE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?$",
     re.IGNORECASE,
 )
-NORMAL_RECIPES = {"anicraft", "texturecraft", "materialcraft", "craft-anything"}
 LAUNCHER_REPO = "craft-launcher"
-SUPPORTED = NORMAL_RECIPES | {LAUNCHER_REPO}
+FEATURES = {
+    "photocraft": "heif",
+    "lightcraft": "lightcraft/heif,lightcraft-cli/heif",
+}
 NOTICE_NAMES = ("README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "ATTRIBUTION.md")
 
 
@@ -296,7 +299,10 @@ def _row(repo: str, state: str, detail: str, remote: str | None = None, installe
         "remote_sha": remote,
         "installed_sha": installed,
         "detail": detail,
-        "build_supported": repo in SUPPORTED,
+        # This is capability discovery, not a frozen catalogue. A verified
+        # Storytold repository is a candidate; build_repo validates its actual
+        # source-local Windows recipe and Cargo metadata before compiling.
+        "build_supported": state != "error",
     }
 
 
@@ -355,11 +361,37 @@ def status_rows(root: Path, repos: Sequence[str]) -> list[dict[str, Any]]:
 
 
 def command_fork(root: Path, repo: str) -> None:
+    _bootstrap(root, repo)
+    print(f"prepared {ACCOUNT}/{repo}")
+
+
+def _bootstrap(root: Path, repo: str) -> None:
     sibling = root / "storytold_forks.py"
     if not sibling.is_file():
         raise InstallError(f"missing bootstrap helper: {sibling}")
     _run([sys.executable, sibling, "--root", root, "bootstrap", repo], timeout=300.0)
-    print(f"prepared {ACCOUNT}/{repo}")
+
+
+def install_repo(root: Path, repo: str) -> str:
+    """Prepare a missing fork/checkout/branch once, then build it safely."""
+    try:
+        row = status_rows(root, [repo])[0]
+    except InstallError as exc:
+        raise InstallError(f"status stage failed for {repo}: {exc}") from exc
+    state = row["state"]
+    if state == "error":
+        raise InstallError(f"status stage failed for {repo}: {row['detail']}")
+    if state in {"new", "needs-clone", "needs-branch"}:
+        try:
+            _bootstrap(root, repo)
+        except InstallError as exc:
+            raise InstallError(f"bootstrap stage failed for {repo}: {exc}") from exc
+    elif state != "ready":
+        raise InstallError(f"status stage failed for {repo}: unexpected state {state!r}")
+    try:
+        return build_repo(root, repo)
+    except InstallError as exc:
+        raise InstallError(f"build stage failed for {repo}: {exc}") from exc
 
 
 def _host_target() -> str:
@@ -397,8 +429,6 @@ def select_packages(
             if binary not in bins.get(package, set()):
                 raise InstallError(f"verified launcher recipe requires {package!r} package with {binary!r} binary")
         return list(required), list(required.values())
-    if repo not in NORMAL_RECIPES:
-        raise InstallError(f"{repo} has no verified Windows source-build recipe")
     required = list(required_binaries or [repo])
     if not required or required[0] != repo:
         raise InstallError(f"Windows recipe must name {repo!r} as its GUI binary")
@@ -428,13 +458,21 @@ def _windows_recipe_bins(source: Path, repo: str) -> list[str] | None:
         text = script.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise InstallError(f"could not read Windows packaging recipe {script}: {exc}") from exc
-    match = re.search(r"(?im)^\s*\$Bins\s*=\s*@\(([^)]*)\)", text)
+    match = re.search(r"(?im)^\s*\$Bins\s*=\s*(?:@\(([^)]*)\)|([^\r\n;]+))", text)
     if not match:
         return None
-    names = re.findall(r"['\"]([a-z0-9][a-z0-9-]*)['\"]", match.group(1))
+    declaration = match.group(1) if match.group(1) is not None else match.group(2)
+    names = re.findall(r"['\"]([a-z0-9][a-z0-9-]*)['\"]", declaration)
     if not names or len(names) != len(set(names)) or names[0] != repo:
         raise InstallError(f"invalid $Bins declaration in {script}")
     return names
+
+
+def _require_windows_recipe(source: Path, repo: str) -> list[str] | None:
+    script = source / "packaging" / "windows" / "package.ps1"
+    if not script.is_file():
+        raise InstallError(f"{repo} source has no documented Windows packaging recipe: {script}")
+    return _windows_recipe_bins(source, repo)
 
 
 def _load_metadata(source: Path, env: dict[str, str], log: Any) -> dict[str, Any]:
@@ -453,6 +491,16 @@ def _load_metadata(source: Path, env: dict[str, str], log: Any) -> dict[str, Any
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise InstallError("cargo metadata returned invalid JSON") from exc
+
+
+def _cargo_build_argv(repo: str, packages: Sequence[str], target: str) -> list[str]:
+    argv = ["cargo", "build", "--release", "--locked", "--target", target]
+    for package_name in packages:
+        argv.extend(["-p", package_name])
+    features = FEATURES.get(repo)
+    if features:
+        argv.extend(["--features", features])
+    return argv
 
 
 def _stream_command(
@@ -523,6 +571,66 @@ def _copy_payload(source: Path, bin_dir: Path, stage: Path, binaries: Sequence[s
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, destination)
             copied.append(rel.as_posix())
+    return copied
+
+
+def _stage_pdfcraft_models(source: Path, stage: Path, env: dict[str, str], log: Any) -> list[str]:
+    """Fetch and independently verify PdfCraft's manifest-declared OCR payload."""
+    manifest_path = source / "ATTRIBUTION.toml"
+    try:
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise InstallError(f"could not read PdfCraft model manifest {manifest_path}: {exc}") from exc
+    fetched = manifest.get("fetched")
+    if not isinstance(fetched, list):
+        raise InstallError("PdfCraft ATTRIBUTION.toml has no fetched asset list")
+    models: list[tuple[str, str, str]] = []
+    for item in fetched:
+        if not isinstance(item, dict) or item.get("kind") != "model":
+            continue
+        name = item.get("file")
+        digest = item.get("sha256")
+        licence_digest = item.get("licence_sha256")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(licence_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", licence_digest)
+        ):
+            raise InstallError("PdfCraft ATTRIBUTION.toml contains an invalid model entry")
+        models.append((name, digest, licence_digest))
+    if not models or len({name for name, _, _ in models}) != len(models):
+        raise InstallError("PdfCraft ATTRIBUTION.toml has no unique model entries")
+
+    models_dir = stage / "models"
+    models_dir.mkdir()
+    for partial in models_dir.glob("*.part"):
+        partial.unlink()
+    argv = ["cargo", "xtask", "models", os.fspath(models_dir)]
+    log.write("$ " + " ".join(argv) + "\n")
+    if _stream_command(argv, cwd=source, env=env, log=log):
+        raise InstallError("cargo xtask models failed")
+    for partial in models_dir.glob("*.part"):
+        partial.unlink()
+
+    copied = ["models/ATTRIBUTION.txt"]
+    attribution = models_dir / "ATTRIBUTION.txt"
+    if not attribution.is_file() or attribution.is_symlink() or not attribution.read_bytes().strip():
+        raise InstallError("PdfCraft model attribution is missing or empty")
+    for name, digest, licence_digest in models:
+        model = models_dir / name
+        licence = models_dir / f"{name}.LICENCE.txt"
+        for path, expected, description in (
+            (model, digest, "model"),
+            (licence, licence_digest, "model licence"),
+        ):
+            if not path.is_file() or path.is_symlink():
+                raise InstallError(f"PdfCraft {description} is missing or not a regular file: {path}")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise InstallError(f"PdfCraft {description} failed ATTRIBUTION.toml verification: {path}")
+        copied.extend([f"models/{name}", f"models/{name}.LICENCE.txt"])
     return copied
 
 
@@ -597,8 +705,6 @@ def _verified_remote_sha(repo: str) -> str:
 def build_repo(root: Path, repo: str) -> str:
     if not _is_windows():
         raise InstallError("build is supported only on Windows")
-    if repo not in SUPPORTED:
-        raise InstallError(f"{repo} has no verified Windows source-build recipe")
     install_base = data_root() / repo
     logs = install_base / "logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -609,6 +715,14 @@ def build_repo(root: Path, repo: str) -> str:
     with repo_lock(repo):
         validate_clone(root, repo)
         remote_sha = _verified_remote_sha(repo)
+        try:
+            active = read_receipt(repo)
+        except InstallError:
+            # A forged, damaged, or legacy receipt is never a fast-path signal.
+            # Rebuild into a fresh stage; activation remains atomic below.
+            active = None
+        if active is not None and active["sha"] == remote_sha:
+            return remote_sha
         log_path = logs / f"build-{remote_sha}.log"
         source_parent = Path(tempfile.mkdtemp(prefix=f"storytold-{repo}-source-"))
         source = source_parent / "source"
@@ -647,16 +761,21 @@ def build_repo(root: Path, repo: str) -> str:
                 build_prefix = "ARTCRAFT_LAUNCHER" if repo == LAUNCHER_REPO else repo.replace("-", "_").upper()
                 env[build_prefix + "_BUILD_SHA"] = remote_sha
                 metadata = _load_metadata(source, env, log)
-                declared = _windows_recipe_bins(source, repo) if repo in NORMAL_RECIPES else None
+                declared = _require_windows_recipe(source, repo)
                 packages, binaries = select_packages(metadata, repo, declared)
-                argv = ["cargo", "build", "--release", "--locked", "--target", target]
-                for package_name in packages:
-                    argv.extend(["-p", package_name])
+                argv = _cargo_build_argv(repo, packages, target)
                 log.write("$ " + " ".join(argv) + "\n")
                 returncode = _stream_command(argv, cwd=source, env=env, log=log)
                 if returncode:
                     raise InstallError(f"Cargo build failed ({returncode})")
                 copied = _copy_payload(source, target_dir / target / "release", stage, binaries)
+                if repo == "pdfcraft":
+                    icon_licence = source / "assets" / "app-icon" / "LICENSE-document.txt"
+                    if not icon_licence.is_file():
+                        raise InstallError(f"PdfCraft document icon licence is missing: {icon_licence}")
+                    shutil.copy2(icon_licence, stage / icon_licence.name)
+                    copied.append(icon_licence.name)
+                    copied.extend(_stage_pdfcraft_models(source, stage, env, log))
                 hashes = {relative: hashlib.sha256((stage / relative).read_bytes()).hexdigest() for relative in copied}
                 receipt = {
                     "schema": 1,
@@ -691,7 +810,7 @@ def build_repo(root: Path, repo: str) -> str:
     return remote_sha
 
 
-def command_open(repo: str) -> None:
+def command_open(repo: str, app_args: Sequence[str] = ()) -> None:
     if not _is_windows():
         raise InstallError("open is supported only on Windows")
     receipt = read_receipt(repo)
@@ -705,7 +824,7 @@ def command_open(repo: str) -> None:
     executable = Path(receipt["_exe"])
     try:
         subprocess.Popen(
-            [str(executable)],
+            [str(executable), *app_args],
             cwd=executable.parent,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -724,14 +843,18 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     status = sub.add_parser("status")
     status.add_argument("repos", nargs="+")
-    for name in ("fork", "build", "open"):
+    for name in ("fork", "build", "install"):
         command = sub.add_parser(name)
         command.add_argument("repo")
+    open_command = sub.add_parser("open")
+    open_command.add_argument("repo")
+    open_command.add_argument("app_args", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = _parser().parse_args(raw_argv)
     try:
         root = args.root.resolve()
         if args.command == "status":
@@ -746,8 +869,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "build":
                 sha = build_repo(root, repo)
                 print(f"installed {repo} at {sha}")
+            elif args.command == "install":
+                sha = install_repo(root, repo)
+                print(f"installed {repo} at {sha}")
             else:
-                command_open(repo)
+                separator = raw_argv.index("--") if "--" in raw_argv else None
+                if separator is None and args.app_args:
+                    raise InstallError("open application arguments require '--' separator")
+                open_index = raw_argv.index("open")
+                before_separator = raw_argv[open_index + 2 : separator] if separator is not None else []
+                if before_separator:
+                    raise InstallError("open application arguments must follow '--' separator")
+                command_open(repo, raw_argv[separator + 1 :] if separator is not None else ())
         return 0
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)

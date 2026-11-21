@@ -30,6 +30,7 @@ mod local_time;
 pub mod model;
 mod motion;
 mod notes;
+mod personal;
 pub mod settings;
 mod settings_dialog;
 mod sheet;
@@ -43,4 +44,5 @@ pub use i18n::{
     Lang, LangInfo, current, detect_system_lang_in_background, fmt, has, lang_from_tag, message, msg, set_current, set_system_locales, system_lang,
     t, t_id, tn, tr, tr_ctx, tr_id, trn,
 };
+pub use personal::{PersonalApp, PersonalRequest, PersonalState};
 pub use settings::Settings;

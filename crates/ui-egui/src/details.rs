@@ -312,7 +312,7 @@ impl LauncherUi {
     fn details_hero(&mut self, ui: &mut Ui, entry: &AppEntry, details: &AppDetails, t: &Tokens, around: (Option<&str>, Option<&str>), wide: bool) {
         let app = entry.app;
         let app_color = rgb(app.color);
-        let status = entry.status(self.platform, self.caps.manage_apps);
+        let status = self.entry_status(entry);
         let hero = egui::Frame::new().fill(tint(app_color, if t.dark { 0.09 } else { 0.07 })).inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {

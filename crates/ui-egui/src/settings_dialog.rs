@@ -173,8 +173,14 @@ impl LauncherUi {
     /// is hidden on hosts that cannot manage apps.
     fn settings_updates(&mut self, ui: &mut Ui) {
         let launcher_id = artcraft_launcher_core::catalog::LAUNCHER_ID;
-        self.request_versions(launcher_id);
+        if self.personal.is_none() {
+            self.request_versions(launcher_id);
+        }
         sheet::panel(ui, tl!("Updates"), |ui| {
+            if self.personal.is_some() {
+                note(ui, tl!("Craft apps are updated from the verified chey branch. Use Refresh or Update all in the app list."));
+                ui.add_space(8.0);
+            }
             let mut every = self.settings.check_every;
             row(ui, tl!("Check for updates"), 150.0, &mut |ui, label| {
                 craft_ui::ComboBox::from_id_salt("every")
@@ -189,14 +195,15 @@ impl LauncherUi {
                     .labelled_by(label);
             });
             self.settings.check_every = every;
-            if self.caps.manage_apps
+            if self.personal.is_none()
+                && self.caps.manage_apps
                 && ui.checkbox(&mut self.settings.auto_update, tl!("Automatically download and install updates")).changed()
                 && self.settings.auto_update
             {
                 self.trigger_auto_updates();
             }
             // Linux always batches (`Settings::updates_batched`), so there is nothing to choose.
-            if self.caps.manage_apps && !cfg!(target_os = "linux") {
+            if self.personal.is_none() && self.caps.manage_apps && !cfg!(target_os = "linux") {
                 ui.checkbox(&mut self.settings.batch_updates, tl!("Ask for permission once when updating all apps"));
                 let mut at_once = self.settings.simultaneous_downloads.min(4);
                 let no_limit = tl!("No limit").to_string();
@@ -216,19 +223,21 @@ impl LauncherUi {
                 self.settings.simultaneous_downloads = at_once;
                 note(ui, tl!("Downloads running together share your connection, so each one is slower."));
             }
-            ui.checkbox(&mut self.settings.notify, tl!("Notify me when an installed app has an update"));
-            ui.checkbox(&mut self.settings.prereleases, tl!("Include pre-releases (betas and release candidates)"));
-            row(ui, tl!("Launcher version"), 200.0, &mut |ui, label| {
-                self.version_combo(ui, launcher_id, &artcraft_launcher_core::catalog::LAUNCHER, 200.0, label);
-                self.version_lock(ui, launcher_id);
-            });
-            self.launcher_version_notes(ui);
+            if self.personal.is_none() {
+                ui.checkbox(&mut self.settings.notify, tl!("Notify me when an installed app has an update"));
+                ui.checkbox(&mut self.settings.prereleases, tl!("Include pre-releases (betas and release candidates)"));
+                row(ui, tl!("Launcher version"), 200.0, &mut |ui, label| {
+                    self.version_combo(ui, launcher_id, &artcraft_launcher_core::catalog::LAUNCHER, 200.0, label);
+                    self.version_lock(ui, launcher_id);
+                });
+                self.launcher_version_notes(ui);
+            }
         });
     }
 
     /// Where apps go and in what format, for the desktop builds that manage installs.
     fn settings_install(&mut self, ui: &mut Ui, host: &mut dyn Host) {
-        if !self.caps.manage_apps {
+        if self.personal.is_some() || !self.caps.manage_apps {
             return;
         }
         sheet::panel(ui, tl!("Default install folder"), |ui| {

@@ -60,6 +60,7 @@ pub(crate) fn date_text(secs: i64) -> String {
 
 /// What the main button of an app does.
 enum Primary {
+    ForkInstall,
     Install,
     /// The download is already here; only the install step is left. Carries the button's label
     /// and shorter ones for when it doesn't fit.
@@ -208,11 +209,29 @@ impl LauncherUi {
             self.settings.filter = Filter::All;
         }
         let t = Tokens::get(ui.ctx());
-        if self.dialog.is_none()
-            && let Some(r) = self.launcher_update.clone()
-        {
-            self.launcher_update_banner(ui, &t, &r);
-            ui.add_space(14.0);
+        if let Some((message, error)) = self.personal.as_ref().and_then(|p| p.message.clone()) {
+            ui.label(RichText::new(message).size(12.5).color(if error { t.bad } else { t.muted }));
+            ui.add_space(8.0);
+        }
+        if self.dialog.is_none() {
+            let personal_launcher = self.personal.as_ref().and_then(|personal| {
+                let row = personal.launcher()?;
+                (personal.status_known
+                    && row.state == crate::PersonalState::Ready
+                    && row.build_supported
+                    && row.installed_sha.is_some()
+                    && row.remote_sha != row.installed_sha)
+                    .then(|| (row.remote_sha.clone(), personal.busy))
+            });
+            if let Some((remote_sha, busy)) = personal_launcher {
+                self.personal_launcher_update_banner(ui, &t, remote_sha.as_deref(), busy);
+                ui.add_space(14.0);
+            } else if self.personal.is_none()
+                && let Some(r) = self.launcher_update.clone()
+            {
+                self.launcher_update_banner(ui, &t, &r);
+                ui.add_space(14.0);
+            }
         }
         self.announcements(ui);
         let updates = self.count(Filter::Updates);
@@ -361,7 +380,8 @@ impl LauncherUi {
     /// The toolbar's check button. It queues a forced check through the UI action boundary and is
     /// disabled while `self.checking`; the backend receives the check only when this pass flushes.
     fn refresh_button(&mut self, ui: &mut Ui) {
-        if crate::bar::refresh_button(ui, tl!("Check for updates"), self.checking).clicked() {
+        let busy = self.personal.as_ref().is_some_and(|p| p.busy) || self.checking;
+        if crate::bar::refresh_button(ui, tl!("Check for updates"), busy).clicked() {
             self.check_now_from_ui();
         }
     }
@@ -437,7 +457,15 @@ impl LauncherUi {
     pub(crate) fn footer(&mut self, ui: &mut Ui) {
         let t = Tokens::get(ui.ctx());
         let now = self.backend.now();
-        let status = if self.checking {
+        let status = if let Some(personal) = &self.personal {
+            if personal.busy {
+                tl!("Building from the verified chey branch…").to_string()
+            } else if personal.status_known {
+                tl!("Checked the verified chey branch source").to_string()
+            } else {
+                tl!("Fork status unavailable").to_string()
+            }
+        } else if self.checking {
             tl!("Checking for updates…").to_string()
         } else if let Some(at) = self.settings.last_check {
             let ago = ago_text(at, now);
@@ -567,7 +595,7 @@ impl LauncherUi {
         let lift = ui.ctx().animate_bool_with_time(ui.scope_id().with(("card-hover", id)), hovered, wipe);
         // An app that is not installed is drawn in greys (icon, name, version, accent), and in its
         // colours while the pointer is over its card.
-        let installed = entry.status(self.platform, self.caps.manage_apps).is_installed();
+        let installed = self.entry_status(&entry).is_installed();
         let in_colour = installed || hovered;
         // The text and accent use the theme's muted grey; the icon is a grey copy of itself.
         let app_color = if installed { rgb(app.color) } else { t.muted.lerp_to_gamma(rgb(app.color), lift) };
@@ -592,9 +620,9 @@ impl LauncherUi {
         }
 
         // The top strip: the version in the app's colour, and its GitHub page.
-        let status = entry.status(self.platform, self.caps.manage_apps);
+        let status = self.entry_status(&entry);
         let behind = self.behind_latest(&entry);
-        let version = crate::card_parts::strip_version(&entry, &status, behind.as_deref());
+        let version = self.personal_version_parts(&entry).unwrap_or_else(|| crate::card_parts::strip_version(&entry, &status, behind.as_deref()));
         let strip = Rect::from_min_size(rect.min, vec2(rect.width(), STRIP_H));
         painter.hline(strip.x_range(), strip.bottom() - 0.5, t.hairline());
         {
@@ -657,7 +685,8 @@ impl LauncherUi {
         // Installed and up to date needs no badge: the strip has the version, and the group says the rest.
         if !matches!(status, AppStatus::UpToDate | AppStatus::Installed) {
             ui.horizontal(|ui| {
-                let (text, tone) = model::entry_status_text(&entry, &status, self.caps.manage_apps);
+                let (text, tone) =
+                    self.personal_status_text(&entry, &status).unwrap_or_else(|| model::entry_status_text(&entry, &status, self.caps.manage_apps));
                 let r = widgets::badge(ui, &text, widgets::tone_color(&t, tone));
                 if let Some(f) = entry.failure() {
                     r.on_hover_text(fmt(tl!("Couldn't check for updates: {f}"), &[("f", f)]));
@@ -839,7 +868,7 @@ impl LauncherUi {
         let pin_w = self.pin_slot_w(body.ui_mut());
         for (i, id) in ids.iter().enumerate() {
             let Some(entry) = self.entry(id).cloned() else { continue };
-            let status = entry.status(self.platform, self.caps.manage_apps);
+            let status = self.entry_status(&entry);
             let row_h = self.table_row_h(body.ui_mut(), &entry, &status);
             body.row(row_h, |mut row| {
                 row.col(|ui| self.table_app_cell(ui, &entry, id, i < last, t, (fonts.0, fonts.1, rule.0, rule.1)));
@@ -892,7 +921,7 @@ impl LauncherUi {
                 self.detail = Some(id.to_string());
             }
         }
-        let installed = entry.status(self.platform, self.caps.manage_apps).is_installed();
+        let installed = self.entry_status(entry).is_installed();
         if let Some(icon) = crate::icons::app_image(ui.ctx(), entry.app.id, installed) {
             // Decorative: the wordmark beside it carries the app name.
             ui.add(icon.fit_to_exact_size(vec2(38.0, 38.0)));
@@ -912,7 +941,9 @@ impl LauncherUi {
     /// The status column: one badge, with the check failure (if any) in its tooltip.
     fn table_status_cell(&self, ui: &mut Ui, entry: &AppEntry, status: &AppStatus, t: &Tokens) {
         // Installed is all it says: being up to date is the absence of an update.
-        let (text, tone) = if *status == AppStatus::UpToDate && entry.job.is_none() && entry.paused.is_none() {
+        let (text, tone) = if let Some(value) = self.personal_status_text(entry, status) {
+            value
+        } else if *status == AppStatus::UpToDate && entry.job.is_none() && entry.paused.is_none() {
             model::status_text(&AppStatus::Installed, self.caps.manage_apps)
         } else {
             model::entry_status_text(entry, status, self.caps.manage_apps)
@@ -1003,6 +1034,31 @@ impl LauncherUi {
     }
 
     fn primary_action(&self, entry: &AppEntry, status: &AppStatus) -> Primary {
+        if let Some(personal) = &self.personal {
+            if entry.app.kind == AppKind::Community {
+                return Primary::Unavailable(tl!("Information only"));
+            }
+            let Some(row) = personal.row(entry.app.id) else { return Primary::Unavailable(tl!("Status unavailable")) };
+            if !personal.status_known {
+                return Primary::Unavailable(tl!("Checking…"));
+            }
+            if personal.busy {
+                return Primary::Unavailable(tl!("Working…"));
+            }
+            return match row.state {
+                crate::PersonalState::New | crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch if row.build_supported => {
+                    Primary::ForkInstall
+                }
+                crate::PersonalState::Ready if !row.build_supported => Primary::Unavailable(tl!("Build unavailable")),
+                crate::PersonalState::Ready if row.installed_sha.is_none() => Primary::Install,
+                crate::PersonalState::Ready if row.remote_sha != row.installed_sha => {
+                    Primary::Update(row.remote_sha.as_deref().map(crate::personal::short_sha).unwrap_or("chey").to_string())
+                }
+                crate::PersonalState::Ready => Primary::Open,
+                crate::PersonalState::Error => Primary::Unavailable(tl!("Unavailable")),
+                _ => Primary::Unavailable(tl!("Build unavailable")),
+            };
+        }
         if !self.caps.manage_apps {
             let platform = self.platform;
             let url = entry.release().zip(platform).and_then(|(r, p)| {
@@ -1272,6 +1328,11 @@ impl LauncherUi {
     /// What the main button does: open, install/update, retry, plain download, or nothing.
     fn primary_button(&mut self, ui: &mut Ui, entry: &AppEntry, id: &str, status: &AppStatus, main_w: f32, place: Place) {
         match self.primary_action(entry, status) {
+            Primary::ForkInstall => {
+                if widgets::button(ui, tl!("Fork and install"), Kind::Primary, main_w).clicked() {
+                    self.install_app(id);
+                }
+            }
             Primary::Install => {
                 if self.size_hint(widgets::button(ui, tl!("Install"), Kind::Primary, main_w), entry).clicked() {
                     self.install_app(id);
@@ -1362,7 +1423,7 @@ impl LauncherUi {
         let manage = self.caps.manage_apps;
         let reveal = self.caps.reveal_label;
         widgets::more_menu(ui, entry.app.name, |ui| {
-            if ui.button(tl!("Choose version")).clicked() {
+            if self.personal.is_none() && ui.button(tl!("Choose version")).clicked() {
                 self.open_versions(&id);
                 ui.close();
             }
@@ -1378,7 +1439,7 @@ impl LauncherUi {
                 self.install_app(&id);
                 ui.close();
             }
-            if manage && status.is_installed() {
+            if self.personal.is_none() && manage && status.is_installed() {
                 self.menu_installed(ui, entry, status, reveal);
             }
             if !manage {
@@ -1400,6 +1461,61 @@ impl LauncherUi {
             self.menu_pin(ui, entry, &id, allow_reorder);
             self.menu_hide(ui, entry, &id);
         });
+    }
+
+    /// The source-build launcher's own verified chey receipt is stale. It deliberately reuses the
+    /// built-in banner treatment, but its only action goes through the helper-backed dispatch.
+    fn personal_launcher_update_banner(&mut self, ui: &mut Ui, t: &Tokens, remote_sha: Option<&str>, busy: bool) {
+        egui::Frame::new()
+            .fill(tint(t.accent, if t.dark { 0.10 } else { 0.07 }))
+            .stroke(Stroke::new(1.0, tint(t.accent, 0.6)))
+            .inner_margin(egui::Margin::symmetric(16, 10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::tag(ui, tl!("Update"), t.accent, Color32::WHITE);
+                    ui.add_space(4.0);
+                    let version = remote_sha.map(crate::personal::short_sha).unwrap_or("chey");
+                    ui.label(
+                        RichText::new(fmt(tl!("ArtCraft Launcher {version} is available."), &[("version", version)]))
+                            .family(theme::medium())
+                            .color(t.ink_strong),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled_ui(!busy, |ui| widgets::button(ui, tl!("Install update"), Kind::Primary, 0.0)).inner.clicked() {
+                            self.act_command(Command::UpdateLauncher);
+                        }
+                    });
+                });
+            });
+    }
+
+    fn personal_status_text(&self, entry: &AppEntry, status: &AppStatus) -> Option<(String, model::Tone)> {
+        let personal = self.personal.as_ref()?;
+        if entry.app.kind == AppKind::Community {
+            return Some((tl!("Information only").to_string(), model::Tone::Faint));
+        }
+        let row = personal.row(entry.app.id)?;
+        let value = match row.state {
+            crate::PersonalState::New => (tl!("New").to_string(), model::Tone::Info),
+            crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch => (tl!("Setup needed").to_string(), model::Tone::Info),
+            crate::PersonalState::Error => (tl!("Unavailable").to_string(), model::Tone::Warn),
+            crate::PersonalState::Ready if row.installed_sha.is_none() => (tl!("Not installed").to_string(), model::Tone::Faint),
+            crate::PersonalState::Ready if *status == AppStatus::UpdateAvailable => (tl!("Update available").to_string(), model::Tone::Warn),
+            crate::PersonalState::Ready => (tl!("Installed").to_string(), model::Tone::Good),
+        };
+        Some(value)
+    }
+
+    fn personal_version_parts(&self, entry: &AppEntry) -> Option<Vec<(String, bool)>> {
+        let row = self.personal.as_ref()?.row(entry.app.id)?;
+        let installed = row.installed_sha.as_deref().map(crate::personal::short_sha);
+        let remote = row.remote_sha.as_deref().map(crate::personal::short_sha);
+        Some(match (installed, remote) {
+            (Some(a), Some(b)) if a != b => vec![(format!("{a} → "), false), (format!("chey {b}"), true)],
+            (Some(a), _) => vec![(format!("installed {a}"), true)],
+            (None, Some(b)) => vec![(format!("chey {b}"), true)],
+            _ => Vec::new(),
+        })
     }
 
     /// Pin — or unpin — the app at the top of the list. Hidden apps are not offered Pin to top
