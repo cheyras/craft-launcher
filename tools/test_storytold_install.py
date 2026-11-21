@@ -97,7 +97,7 @@ class InstallerTests(unittest.TestCase):
         rows = json.loads(stdout.getvalue())
         self.assertEqual(["new", "error", "ready"], [row["state"] for row in rows])
         self.assertEqual(
-            {"repo", "state", "remote_sha", "installed_sha", "detail", "build_supported"},
+            {"repo", "state", "remote_sha", "installed_sha", "installed_msi_version", "detail", "build_supported"},
             set(rows[0]),
         )
         self.assertTrue(rows[0]["build_supported"])
@@ -139,6 +139,36 @@ class InstallerTests(unittest.TestCase):
             row = install.status_rows(self.root, ["anicraft"])[0]
         self.assertEqual("error", row["state"])
         self.assertEqual(SHA_A, row["installed_sha"])
+
+    def test_status_detects_legacy_msi_offline_without_inventing_source_sha(self):
+        executable = self.local / "CadCraft" / "cadcraft.exe"
+        executable.parent.mkdir()
+        executable.write_bytes(b"legacy MSI")
+        product = install.msi.InstalledProduct(
+            "cadcraft", install.msi.UPGRADE_CODES["cadcraft"],
+            "11111111-1111-1111-1111-111111111111", "1.2.3",
+            str(executable), str(executable.parent),
+        )
+        with mock.patch.object(install, "_is_windows", return_value=True), mock.patch.object(
+            install.msi, "inventory", return_value=product
+        ), mock.patch.object(install.msi, "read_receipt", return_value=None), mock.patch.object(
+            install, "query_forks", side_effect=install.InstallError("offline")
+        ):
+            row = install.status_rows(self.root, ["cadcraft"])[0]
+        self.assertEqual("1.2.3", row["installed_msi_version"])
+        self.assertIsNone(row["installed_sha"])
+        self.assertIn("offline", row["detail"])
+
+    def test_prepare_msi_cli_stages_without_apply(self):
+        stdout = io.StringIO()
+        with mock.patch.object(install, "prepare_msi_repo", return_value=SHA_B) as prepare, mock.patch.object(
+            install, "_apply_prepared_msi"
+        ) as apply, contextlib.redirect_stdout(stdout):
+            code = install.main(["--root", str(self.root), "prepare-msi", "cadcraft"])
+        self.assertEqual(0, code)
+        prepare.assert_called_once_with(self.root.resolve(), "cadcraft")
+        apply.assert_not_called()
+        self.assertIn("prepared MSI", stdout.getvalue())
 
     def test_query_rejects_inexact_returned_repository_identity(self):
         node = fork_node("anicraft")
@@ -383,6 +413,27 @@ class InstallerTests(unittest.TestCase):
         ):
             self.assertEqual(SHA_B, install.build_repo(self.root, "anicraft"))
         remote.assert_called_once_with("anicraft")
+
+    def test_build_prioritizes_existing_msi_and_never_activates_portable_on_failure(self):
+        executable = self.local / "CadCraft" / "cadcraft.exe"
+        executable.parent.mkdir()
+        executable.write_bytes(b"installed")
+        product = install.msi.InstalledProduct(
+            "cadcraft", install.msi.UPGRADE_CODES["cadcraft"],
+            "11111111-1111-1111-1111-111111111111", "1.0.0",
+            str(executable), str(executable.parent),
+        )
+        with mock.patch.object(install, "_is_windows", return_value=True), mock.patch.object(
+            install, "_installed_msi", return_value=product
+        ), mock.patch.object(install, "prepare_msi_repo", return_value=SHA_B) as prepare, mock.patch.object(
+            install.msi, "read_receipt", return_value=None
+        ), mock.patch.object(
+            install, "_apply_prepared_msi", side_effect=install.InstallError("UAC cancelled")
+        ), mock.patch.object(install, "_atomic_json") as portable_activate:
+            with self.assertRaisesRegex(install.InstallError, "UAC cancelled"):
+                install.build_repo(self.root, "cadcraft")
+        prepare.assert_called_once_with(self.root, "cadcraft")
+        portable_activate.assert_not_called()
 
     def test_pdfcraft_stages_verified_models_and_not_partial_files(self):
         source = self.root / "pdfcraft-source"

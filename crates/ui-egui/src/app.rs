@@ -483,7 +483,7 @@ impl LauncherUi {
                 let repos = apps
                     .iter()
                     .filter_map(|id| personal.row(id))
-                    .filter(|r| r.state == crate::PersonalState::Ready && r.installed_sha.is_some() && r.remote_sha != r.installed_sha)
+                    .filter(|r| r.build_supported && r.update_available())
                     .map(|r| r.repo.clone())
                     .collect();
                 personal.requests.push(crate::PersonalRequest::UpdateAll { repos });
@@ -492,7 +492,7 @@ impl LauncherUi {
                 if let Some(row) = personal.any_row(&app).cloned()
                     && !personal.busy
                     && personal.status_known
-                    && row.installed_sha.is_some()
+                    && row.is_installed()
                 {
                     personal.requests.push(crate::PersonalRequest::Open { repo: row.repo, args });
                 }
@@ -697,10 +697,13 @@ impl LauncherUi {
         }
         let Some(row) = personal.row(entry.app.id) else { return AppStatus::Unavailable };
         match row.state {
-            crate::PersonalState::New | crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch => AppStatus::Available,
+            crate::PersonalState::New => AppStatus::Available,
+            crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch if row.update_available() => AppStatus::UpdateAvailable,
+            crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch => AppStatus::Available,
+            crate::PersonalState::Error if row.is_installed() => AppStatus::UpToDate,
             crate::PersonalState::Error => AppStatus::Unavailable,
-            crate::PersonalState::Ready if row.installed_sha.is_none() => AppStatus::Available,
-            crate::PersonalState::Ready if row.remote_sha != row.installed_sha => AppStatus::UpdateAvailable,
+            crate::PersonalState::Ready if !row.is_installed() => AppStatus::Available,
+            crate::PersonalState::Ready if row.update_available() => AppStatus::UpdateAvailable,
             crate::PersonalState::Ready => AppStatus::UpToDate,
         }
     }
@@ -1368,6 +1371,26 @@ mod tests {
         (LauncherUi::new(&ctx, Box::new(backend), settings), sent, ctx)
     }
 
+    fn personal_row(
+        id: &str,
+        state: crate::PersonalState,
+        remote_sha: Option<&str>,
+        installed_sha: Option<&str>,
+        installed_msi_version: Option<&str>,
+        build_supported: bool,
+    ) -> crate::PersonalApp {
+        crate::PersonalApp {
+            id: id.into(),
+            repo: id.into(),
+            state,
+            remote_sha: remote_sha.map(str::to_string),
+            installed_sha: installed_sha.map(str::to_string),
+            installed_msi_version: installed_msi_version.map(str::to_string),
+            detail: String::new(),
+            build_supported,
+        }
+    }
+
     #[test]
     fn ordinary_launcher_ui_has_no_personal_mode() {
         let (ui, _, _) = launcher();
@@ -1394,6 +1417,7 @@ mod tests {
             state,
             remote_sha: remote.map(str::to_string),
             installed_sha: installed.map(str::to_string),
+            installed_msi_version: None,
             detail: String::new(),
             build_supported: supported,
         };
@@ -1433,6 +1457,75 @@ mod tests {
             ]
         );
         assert!(sent.borrow().is_empty(), "no official backend command may cross the personal boundary");
+    }
+
+    #[test]
+    fn recognized_msi_without_sha_dispatches_update_and_open() {
+        let (mut ui, sent, _) = launcher();
+        ui.enable_personal_mode();
+        ui.set_personal_status(
+            vec![personal_row("anicraft", crate::PersonalState::Ready, Some("bbbbbbbbbbbbbbbb"), None, Some("1.4.0"), true)],
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(ui.entry_status(ui.entry("anicraft").unwrap()), AppStatus::UpdateAvailable);
+        assert!(ui.dispatch_personal(Command::Install { app: "anicraft".into() }));
+        assert!(ui.dispatch_personal(Command::Launch { app: "anicraft".into(), args: Vec::new() }));
+        assert_eq!(
+            ui.take_personal_requests(),
+            vec![
+                crate::PersonalRequest::Install { repo: "anicraft".into() },
+                crate::PersonalRequest::Open { repo: "anicraft".into(), args: Vec::new() },
+            ]
+        );
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn recognized_msi_can_open_during_source_error_but_cannot_install() {
+        let (mut ui, _, _) = launcher();
+        ui.enable_personal_mode();
+        ui.set_personal_status(vec![personal_row("anicraft", crate::PersonalState::Error, None, None, Some("1.4.0"), false)], false, true, None);
+
+        assert_eq!(ui.entry_status(ui.entry("anicraft").unwrap()), AppStatus::UpToDate);
+        assert!(ui.dispatch_personal(Command::Install { app: "anicraft".into() }));
+        assert!(ui.take_personal_requests().is_empty());
+        assert!(ui.dispatch_personal(Command::Launch { app: "anicraft".into(), args: vec!["--safe".into()] }));
+        assert_eq!(ui.take_personal_requests(), vec![crate::PersonalRequest::Open { repo: "anicraft".into(), args: vec!["--safe".into()] }]);
+    }
+
+    #[test]
+    fn matching_managed_sha_is_up_to_date() {
+        let (mut ui, _, _) = launcher();
+        ui.enable_personal_mode();
+        ui.set_personal_status(
+            vec![personal_row("anicraft", crate::PersonalState::Ready, Some("aaaaaaaaaaaaaaaa"), Some("aaaaaaaaaaaaaaaa"), Some("1.4.0"), true)],
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(ui.entry_status(ui.entry("anicraft").unwrap()), AppStatus::UpToDate);
+    }
+
+    #[test]
+    fn update_all_excludes_ready_but_uninstalled_apps() {
+        let (mut ui, _, _) = launcher();
+        ui.enable_personal_mode();
+        ui.set_personal_status(
+            vec![
+                personal_row("anicraft", crate::PersonalState::Ready, Some("bbbbbbbbbbbbbbbb"), None, Some("1.4.0"), true),
+                personal_row("texturecraft", crate::PersonalState::Ready, Some("cccccccccccccccc"), None, None, true),
+            ],
+            false,
+            true,
+            None,
+        );
+
+        assert!(ui.dispatch_personal(Command::InstallAll { apps: vec!["anicraft".into(), "texturecraft".into()] }));
+        assert_eq!(ui.take_personal_requests(), vec![crate::PersonalRequest::UpdateAll { repos: vec!["anicraft".into()] }]);
     }
 
     /// One `run_ui` pass at a chosen input time, exactly like the native shell's callback order.

@@ -219,7 +219,7 @@ impl LauncherUi {
                 (personal.status_known
                     && row.state == crate::PersonalState::Ready
                     && row.build_supported
-                    && row.installed_sha.is_some()
+                    && row.is_installed()
                     && row.remote_sha != row.installed_sha)
                     .then(|| (row.remote_sha.clone(), personal.busy))
             });
@@ -1049,15 +1049,19 @@ impl LauncherUi {
                 return Primary::Unavailable(tl!("Working…"));
             }
             return match row.state {
-                crate::PersonalState::New | crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch if row.build_supported => {
-                    Primary::ForkInstall
+                crate::PersonalState::New if row.build_supported => Primary::ForkInstall,
+                crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch if row.build_supported && row.is_installed() => {
+                    Primary::Update(row.remote_sha.as_deref().map(crate::personal::short_sha).unwrap_or("chey").to_string())
                 }
+                crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch if row.build_supported => Primary::ForkInstall,
+                crate::PersonalState::Ready if !row.build_supported && row.is_installed() => Primary::Open,
                 crate::PersonalState::Ready if !row.build_supported => Primary::Unavailable(tl!("Build unavailable")),
-                crate::PersonalState::Ready if row.installed_sha.is_none() => Primary::Install,
-                crate::PersonalState::Ready if row.remote_sha != row.installed_sha => {
+                crate::PersonalState::Ready if !row.is_installed() => Primary::Install,
+                crate::PersonalState::Ready if row.update_available() => {
                     Primary::Update(row.remote_sha.as_deref().map(crate::personal::short_sha).unwrap_or("chey").to_string())
                 }
                 crate::PersonalState::Ready => Primary::Open,
+                crate::PersonalState::Error if row.is_installed() => Primary::Open,
                 crate::PersonalState::Error => Primary::Unavailable(tl!("Unavailable")),
                 _ => Primary::Unavailable(tl!("Build unavailable")),
             };
@@ -1500,9 +1504,13 @@ impl LauncherUi {
         let row = personal.row(entry.app.id)?;
         let value = match row.state {
             crate::PersonalState::New => (tl!("New").to_string(), model::Tone::Info),
+            crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch if row.is_installed() => {
+                (tl!("Update available").to_string(), model::Tone::Warn)
+            }
             crate::PersonalState::NeedsClone | crate::PersonalState::NeedsBranch => (tl!("Setup needed").to_string(), model::Tone::Info),
+            crate::PersonalState::Error if row.is_installed() => (tl!("Installed").to_string(), model::Tone::Good),
             crate::PersonalState::Error => (tl!("Unavailable").to_string(), model::Tone::Warn),
-            crate::PersonalState::Ready if row.installed_sha.is_none() => (tl!("Not installed").to_string(), model::Tone::Faint),
+            crate::PersonalState::Ready if !row.is_installed() => (tl!("Not installed").to_string(), model::Tone::Faint),
             crate::PersonalState::Ready if *status == AppStatus::UpdateAvailable => (tl!("Update available").to_string(), model::Tone::Warn),
             crate::PersonalState::Ready => (tl!("Installed").to_string(), model::Tone::Good),
         };
@@ -1511,7 +1519,7 @@ impl LauncherUi {
 
     fn personal_version_parts(&self, entry: &AppEntry) -> Option<Vec<(String, bool)>> {
         let row = self.personal.as_ref()?.row(entry.app.id)?;
-        let installed = row.installed_sha.as_deref().map(crate::personal::short_sha);
+        let installed = row.installed_sha.as_deref().map(crate::personal::short_sha).or(row.installed_msi_version.as_deref());
         let remote = row.remote_sha.as_deref().map(crate::personal::short_sha);
         Some(match (installed, remote) {
             (Some(a), Some(b)) if a != b => vec![(format!("{a} → "), false), (format!("chey {b}"), true)],

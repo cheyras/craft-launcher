@@ -49,9 +49,17 @@ struct StatusRecord {
     state: ForkState,
     remote_sha: Option<String>,
     installed_sha: Option<String>,
+    #[serde(default)]
+    installed_msi_version: Option<String>,
     detail: String,
     #[serde(default)]
     build_supported: bool,
+}
+
+impl StatusRecord {
+    fn is_installed(&self) -> bool {
+        self.installed_sha.is_some() || self.installed_msi_version.is_some()
+    }
 }
 
 struct Work {
@@ -152,6 +160,7 @@ impl PersonalForks {
                     },
                     remote_sha: r.remote_sha.clone(),
                     installed_sha: r.installed_sha.clone(),
+                    installed_msi_version: r.installed_msi_version.clone(),
                     detail: r.detail.clone(),
                     build_supported: r.build_supported,
                 })
@@ -226,7 +235,7 @@ impl PersonalForks {
         }
         let allowed = self.rows.get(&repo).is_some_and(|r| match action {
             Action::Install => r.build_supported && r.state != ForkState::Error,
-            Action::Open => r.installed_sha.is_some(),
+            Action::Open => r.is_installed(),
             Action::Status => false,
         });
         if allowed {
@@ -292,7 +301,10 @@ fn status_from_output(output: Output, expected: &[String]) -> Result<Vec<StatusR
         if !expected.contains(row.repo.as_str()) || !seen.insert(row.repo.as_str()) {
             return Err(format!("Helper returned an unknown or duplicate repository: {}", row.repo));
         }
-        if row.remote_sha.as_deref().is_some_and(str::is_empty) || row.installed_sha.as_deref().is_some_and(str::is_empty) {
+        if row.remote_sha.as_deref().is_some_and(str::is_empty)
+            || row.installed_sha.as_deref().is_some_and(str::is_empty)
+            || row.installed_msi_version.as_deref().is_some_and(str::is_empty)
+        {
             return Err(format!("Helper returned an invalid commit status for {}", row.repo));
         }
         if row.state == ForkState::Ready && row.remote_sha.is_none() {
@@ -320,10 +332,12 @@ mod tests {
     #[test]
     fn new_update_and_open_states_remain_distinct() -> Result<(), String> {
         let expected = vec!["a".into(), "b".into(), "c".into()];
-        let json = r#"[{"repo":"a","state":"new","remote_sha":null,"installed_sha":null,"detail":"","build_supported":true},{"repo":"b","state":"ready","remote_sha":"2222222222222222","installed_sha":"1111111111111111","detail":"","build_supported":true},{"repo":"c","state":"ready","remote_sha":"3333333333333333","installed_sha":"3333333333333333","detail":"","build_supported":true}]"#;
+        let json = r#"[{"repo":"a","state":"new","remote_sha":null,"installed_sha":null,"detail":"","build_supported":true},{"repo":"b","state":"ready","remote_sha":"2222222222222222","installed_sha":null,"installed_msi_version":"1.4.0","detail":"","build_supported":true},{"repo":"c","state":"ready","remote_sha":"3333333333333333","installed_sha":"3333333333333333","detail":"","build_supported":true}]"#;
         let rows = status_from_output(output(json), &expected)?;
         assert_eq!(rows[0].state, ForkState::New);
         assert_ne!(rows[1].remote_sha, rows[1].installed_sha);
+        assert!(rows[1].is_installed());
+        assert_eq!(rows[1].installed_msi_version.as_deref(), Some("1.4.0"));
         assert_eq!(rows[2].remote_sha, rows[2].installed_sha);
         Ok(())
     }

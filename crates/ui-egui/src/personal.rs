@@ -20,8 +20,28 @@ pub struct PersonalApp {
     pub state: PersonalState,
     pub remote_sha: Option<String>,
     pub installed_sha: Option<String>,
+    pub installed_msi_version: Option<String>,
     pub detail: String,
     pub build_supported: bool,
+}
+
+impl PersonalApp {
+    /// The helper found either an exact managed build or one installed Windows Installer product.
+    pub fn is_installed(&self) -> bool {
+        self.installed_sha.is_some() || self.installed_msi_version.is_some()
+    }
+
+    /// This installed source can be brought to the helper's known current build.
+    pub(crate) fn update_available(&self) -> bool {
+        if !self.is_installed() {
+            return false;
+        }
+        match self.state {
+            PersonalState::NeedsClone | PersonalState::NeedsBranch => true,
+            PersonalState::Ready => self.remote_sha.is_some() && self.remote_sha != self.installed_sha,
+            PersonalState::New | PersonalState::Error => false,
+        }
+    }
 }
 
 /// A request returned to the native shell. No helper or filesystem work happens in this crate.

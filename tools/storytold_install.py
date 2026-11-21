@@ -22,8 +22,11 @@ import tempfile
 import time
 import tomllib
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterator, Sequence
+
+import storytold_msi as msi
 
 
 ACCOUNT = "cheyras"
@@ -292,12 +295,20 @@ def _validate_remote_node(repo: str, node: dict[str, Any], *, require_branch: bo
     return oid
 
 
-def _row(repo: str, state: str, detail: str, remote: str | None = None, installed: str | None = None) -> dict[str, Any]:
+def _row(
+    repo: str,
+    state: str,
+    detail: str,
+    remote: str | None = None,
+    installed: str | None = None,
+    installed_msi_version: str | None = None,
+) -> dict[str, Any]:
     return {
         "repo": repo,
         "state": state,
         "remote_sha": remote,
         "installed_sha": installed,
+        "installed_msi_version": installed_msi_version,
         "detail": detail,
         # This is capability discovery, not a frozen catalogue. A verified
         # Storytold repository is a candidate; build_repo validates its actual
@@ -307,6 +318,24 @@ def _row(repo: str, state: str, detail: str, remote: str | None = None, installe
 
 
 def status_rows(root: Path, repos: Sequence[str]) -> list[dict[str, Any]]:
+    installed_msi: dict[str, tuple[msi.InstalledProduct, dict[str, Any] | None] | None] = {}
+    msi_errors: dict[str, str] = {}
+    if _is_windows():
+        for repo in repos:
+            if repo not in msi.UPGRADE_CODES:
+                continue
+            try:
+                product = msi.inventory(repo)
+                if product is not None:
+                    if _receipt_path(repo).exists():
+                        raise InstallError(
+                            f"{repo} has both MSI registration and a portable active receipt; resolve the ambiguity"
+                        )
+                    installed_msi[repo] = (product, msi.read_receipt(data_root(), product))
+                else:
+                    installed_msi[repo] = None
+            except (msi.MsiError, InstallError) as exc:
+                msi_errors[repo] = str(exc)
     try:
         metadata = query_forks(repos)
     except MixedGitHubResponse:
@@ -318,19 +347,35 @@ def status_rows(root: Path, repos: Sequence[str]) -> list[dict[str, Any]]:
         # never prose or a misleading collection of "new" repositories.
         rows: list[dict[str, Any]] = []
         for repo in repos:
+            if repo in msi_errors:
+                rows.append(_row(repo, "error", msi_errors[repo]))
+                continue
             try:
-                receipt = read_receipt(repo)
-                installed = receipt["sha"] if receipt else None
+                msi_value = installed_msi.get(repo)
+                if msi_value:
+                    product, receipt = msi_value
+                    installed = receipt["source_sha"] if receipt else None
+                    version = product.version
+                else:
+                    receipt = read_receipt(repo)
+                    installed = receipt["sha"] if receipt else None
+                    version = None
             except InstallError as receipt_error:
                 rows.append(_row(repo, "error", f"{exc}; {receipt_error}"))
             else:
-                rows.append(_row(repo, "error", str(exc), installed=installed))
+                rows.append(_row(repo, "error", str(exc), installed=installed, installed_msi_version=version))
         return rows
     rows: list[dict[str, Any]] = []
     for repo in repos:
+        if repo in msi_errors:
+            rows.append(_row(repo, "error", msi_errors[repo]))
+            continue
         node = metadata[repo]
         if node is None:
-            rows.append(_row(repo, "new", f"{ACCOUNT}/{repo} does not exist"))
+            value = installed_msi.get(repo)
+            version = value[0].version if value else None
+            installed = value[1]["source_sha"] if value and value[1] else None
+            rows.append(_row(repo, "new", f"{ACCOUNT}/{repo} does not exist", installed=installed, installed_msi_version=version))
             continue
         try:
             oid = _validate_remote_node(repo, node, require_branch=False)
@@ -338,11 +383,17 @@ def status_rows(root: Path, repos: Sequence[str]) -> list[dict[str, Any]]:
             rows.append(_row(repo, "error", str(exc)))
             continue
         if oid is None:
-            rows.append(_row(repo, "needs-branch", f"fork exists but refs/heads/{BRANCH} is missing"))
+            value = installed_msi.get(repo)
+            version = value[0].version if value else None
+            installed = value[1]["source_sha"] if value and value[1] else None
+            rows.append(_row(repo, "needs-branch", f"fork exists but refs/heads/{BRANCH} is missing", installed=installed, installed_msi_version=version))
             continue
         clone = root / repo
         if not clone.exists():
-            rows.append(_row(repo, "needs-clone", f"missing local clone: {clone}", oid))
+            value = installed_msi.get(repo)
+            version = value[0].version if value else None
+            installed = value[1]["source_sha"] if value and value[1] else None
+            rows.append(_row(repo, "needs-clone", f"missing local clone: {clone}", oid, installed, version))
             continue
         try:
             validate_clone(root, repo)
@@ -350,13 +401,24 @@ def status_rows(root: Path, repos: Sequence[str]) -> list[dict[str, Any]]:
             rows.append(_row(repo, "error", str(exc), oid))
             continue
         try:
-            receipt = read_receipt(repo)
-        except InstallError as exc:
+            msi_value = installed_msi.get(repo)
+            if msi_value:
+                product, msi_receipt = msi_value
+                installed = msi_receipt["source_sha"] if msi_receipt else None
+                version = product.version
+                receipt = None
+            else:
+                receipt = read_receipt(repo)
+                installed = receipt["sha"] if receipt else None
+                version = None
+        except (InstallError, msi.MsiError) as exc:
             rows.append(_row(repo, "error", str(exc), oid))
             continue
-        installed = receipt["sha"] if receipt else None
-        detail = "fork and local clone are ready" if receipt is None else f"installed {installed}"
-        rows.append(_row(repo, "ready", detail, oid, installed))
+        if version is not None:
+            detail = f"MSI {version} is installed" + (f" from {installed}" if installed else " (legacy provenance unknown)")
+        else:
+            detail = "fork and local clone are ready" if receipt is None else f"installed {installed}"
+        rows.append(_row(repo, "ready", detail, oid, installed, version))
     return rows
 
 
@@ -702,9 +764,169 @@ def _verified_remote_sha(repo: str) -> str:
     return sha
 
 
+def _installed_msi(repo: str, *, required: bool = False) -> msi.InstalledProduct | None:
+    if not _is_windows() or repo not in msi.UPGRADE_CODES:
+        if required:
+            raise InstallError(f"{repo} is not a supported installed MSI product")
+        return None
+    try:
+        product = msi.inventory(repo)
+    except msi.MsiError as exc:
+        raise InstallError(str(exc)) from exc
+    if product is None:
+        if required:
+            raise InstallError(f"no installed MSI in the pinned {repo} upgrade family")
+        return None
+    if _receipt_path(repo).exists():
+        raise InstallError(f"{repo} has both MSI registration and a portable active receipt; refusing an ambiguous update")
+    return product
+
+
+def prepare_msi_repo(root: Path, repo: str) -> str:
+    """Build and validate an MSI without changing Windows Installer state."""
+    if not _is_windows():
+        raise InstallError("prepare-msi is supported only on Windows")
+    product = _installed_msi(repo, required=True)
+    assert product is not None
+    install_base = data_root() / repo
+    logs = install_base / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    target = "x86_64-pc-windows-msvc"
+    target_dir = install_base / "msi-cargo-target"
+    with repo_lock(repo):
+        validate_clone(root, repo)
+        remote_sha = _verified_remote_sha(repo)
+        try:
+            current_receipt = msi.read_receipt(data_root(), product)
+        except msi.MsiError as exc:
+            raise InstallError(str(exc)) from exc
+        if current_receipt is not None and current_receipt["source_sha"] == remote_sha:
+            return remote_sha
+        try:
+            msi.validate_prepared(data_root(), product, remote_sha)
+        except msi.MsiError:
+            pass
+        else:
+            return remote_sha
+        log_path = logs / f"prepare-msi-{remote_sha}.log"
+        source_parent = Path(tempfile.mkdtemp(prefix=f"storytold-{repo}-msi-source-"))
+        source = source_parent / "source"
+        dist = source_parent / "dist"
+        try:
+            with log_path.open("w", encoding="utf-8", errors="replace", newline="\n") as log:
+                log.write(f"repository: {ACCOUNT}/{repo}\ncommit: {remote_sha}\nMSI update of: {product.product_code}\n")
+                _run(["git", "init", source])
+                _run(["git", "-C", source, "remote", "add", "origin", f"https://github.com/{ACCOUNT}/{repo}.git"])
+                git_env = os.environ.copy()
+                git_env["GIT_TERMINAL_PROMPT"] = "0"
+                fetched = _run(
+                    ["git", "-C", source, "fetch", "--depth=1", "origin", f"refs/heads/{BRANCH}"],
+                    cwd=source_parent,
+                    env=git_env,
+                    check=False,
+                    timeout=300.0,
+                )
+                log.write("$ git fetch --depth=1 origin refs/heads/chey\n" + fetched.stdout + fetched.stderr)
+                if fetched.returncode:
+                    raise InstallError(f"git fetch failed ({fetched.returncode})")
+                fetched_sha = _run(["git", "-C", source, "rev-parse", "FETCH_HEAD"]).stdout.strip()
+                if fetched_sha != remote_sha:
+                    raise InstallError(f"fetched commit {fetched_sha} does not match verified remote commit {remote_sha}")
+                _run(["git", "-C", source, "checkout", "--detach", remote_sha])
+                script = source / "packaging" / "windows" / "package.ps1"
+                declared = _require_windows_recipe(source, repo)
+                env = msi.scrub_signing_env(os.environ)
+                env["CARGO_TARGET_DIR"] = os.fspath(target_dir.resolve())
+                env["DIST"] = os.fspath(dist.resolve())
+                env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS"] = "-C target-feature=+crt-static"
+                prefix = repo.replace("-", "_").upper()
+                env[prefix + "_REQUIRE_WINRES"] = "1"
+                env[prefix + "_BUILD_SHA"] = remote_sha
+                metadata = _load_metadata(source, env, log)
+                packages, binaries = select_packages(metadata, repo, declared)
+                build_argv = _cargo_build_argv(repo, packages, target)
+                log.write("$ " + " ".join(build_argv) + "\n")
+                if _stream_command(build_argv, cwd=source, env=env, log=log):
+                    raise InstallError("Cargo build failed")
+                executable = target_dir / target / "release" / f"{binaries[0]}.exe"
+                if not executable.is_file():
+                    raise InstallError(f"Cargo succeeded but expected binary is missing: {executable}")
+                candidates = []
+                for wxs in (source / "packaging" / "windows").glob("*.wxs"):
+                    try:
+                        changed = msi.make_upgrade_rollback_safe(wxs, product.upgrade_code)
+                    except msi.MsiError:
+                        continue
+                    candidates.append((wxs, changed))
+                if len(candidates) != 1:
+                    raise InstallError("Windows recipe does not have exactly one pinned Package UpgradeCode")
+                log.write(f"rollback-safe WiX recipe: {candidates[0][0]} (edited={candidates[0][1]})\n")
+                package_argv = ["pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", os.fspath(script), "-Arch", "x64", "-SkipBuild"]
+                log.write("$ " + " ".join(package_argv) + "\n")
+                if _stream_command(package_argv, cwd=source, env=env, log=log):
+                    raise InstallError("Windows MSI packaging failed")
+                packaged_executable = target_dir / "windows-package" / "x64" / f"{binaries[0]}.exe"
+                if not packaged_executable.is_file():
+                    raise InstallError(
+                        f"packaging did not stage the expected executable payload: {packaged_executable}"
+                    )
+                packages_found = list(dist.glob("*.msi"))
+                if len(packages_found) != 1:
+                    raise InstallError(f"packaging produced {len(packages_found)} MSI files instead of one")
+                try:
+                    info = msi.native_api().inspect_package(packages_found[0])
+                    msi.validate_package(info, product, repo)
+                except msi.MsiError as exc:
+                    raise InstallError(f"built MSI failed preflight: {exc}") from exc
+                package_dir = install_base / "prepared" / remote_sha
+                package_dir.mkdir(parents=True, exist_ok=True)
+                persistent = package_dir / packages_found[0].name
+                temporary = package_dir / (packages_found[0].name + ".tmp")
+                shutil.copy2(packages_found[0], temporary)
+                os.replace(temporary, persistent)
+                prepared = {
+                    "schema": 1,
+                    "repo": repo,
+                    "source_sha": remote_sha,
+                    "installed": asdict(product),
+                    "package": os.fspath(persistent.resolve()),
+                    "package_sha256": hashlib.sha256(persistent.read_bytes()).hexdigest(),
+                    "executable_sha256": hashlib.sha256(packaged_executable.read_bytes()).hexdigest(),
+                }
+                msi._atomic_json(msi.prepared_path(data_root(), repo), prepared)
+        except (InstallError, OSError) as exc:
+            raise InstallError(f"{exc}; prepare log: {log_path}") from exc
+        finally:
+            shutil.rmtree(source_parent, ignore_errors=True)
+    return remote_sha
+
+
+def _apply_prepared_msi(repo: str, source_sha: str) -> str:
+    product = _installed_msi(repo, required=True)
+    assert product is not None
+    # MSI is a machine-wide transaction service.  Keep preparations parallel
+    # per repository, but serialize the elevated application phase globally.
+    with repo_lock("_windows-installer"), repo_lock(repo):
+        try:
+            return msi.install_prepared(data_root(), product, source_sha)
+        except msi.MsiError as exc:
+            raise InstallError(str(exc)) from exc
+
+
 def build_repo(root: Path, repo: str) -> str:
     if not _is_windows():
         raise InstallError("build is supported only on Windows")
+    if _installed_msi(repo) is not None:
+        remote_sha = prepare_msi_repo(root, repo)
+        current_product = _installed_msi(repo, required=True)
+        assert current_product is not None
+        try:
+            current_receipt = msi.read_receipt(data_root(), current_product)
+        except msi.MsiError as exc:
+            raise InstallError(str(exc)) from exc
+        if current_receipt is not None and current_receipt["source_sha"] == remote_sha:
+            return remote_sha
+        return _apply_prepared_msi(repo, remote_sha)
     install_base = data_root() / repo
     logs = install_base / "logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -813,15 +1035,19 @@ def build_repo(root: Path, repo: str) -> str:
 def command_open(repo: str, app_args: Sequence[str] = ()) -> None:
     if not _is_windows():
         raise InstallError("open is supported only on Windows")
-    receipt = read_receipt(repo)
-    if receipt is None:
-        raise InstallError(f"{repo} is not installed")
+    product = _installed_msi(repo)
+    if product is not None:
+        executable = Path(product.executable)
+    else:
+        receipt = read_receipt(repo)
+        if receipt is None:
+            raise InstallError(f"{repo} is not installed")
+        executable = Path(receipt["_exe"])
     flags = (
         getattr(subprocess, "DETACHED_PROCESS", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         | getattr(subprocess, "CREATE_NO_WINDOW", 0)
     )
-    executable = Path(receipt["_exe"])
     try:
         subprocess.Popen(
             [str(executable), *app_args],
@@ -833,7 +1059,7 @@ def command_open(repo: str, app_args: Sequence[str] = ()) -> None:
             creationflags=flags,
         )
     except OSError as exc:
-        raise InstallError(f"could not launch {receipt['_exe']}: {exc}") from exc
+        raise InstallError(f"could not launch {executable}: {exc}") from exc
     print(f"opened {repo}")
 
 
@@ -843,7 +1069,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     status = sub.add_parser("status")
     status.add_argument("repos", nargs="+")
-    for name in ("fork", "build", "install"):
+    for name in ("fork", "build", "install", "prepare-msi"):
         command = sub.add_parser(name)
         command.add_argument("repo")
     open_command = sub.add_parser("open")
@@ -872,6 +1098,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "install":
                 sha = install_repo(root, repo)
                 print(f"installed {repo} at {sha}")
+            elif args.command == "prepare-msi":
+                sha = prepare_msi_repo(root, repo)
+                print(f"prepared MSI for {repo} at {sha}")
             else:
                 separator = raw_argv.index("--") if "--" in raw_argv else None
                 if separator is None and args.app_args:
